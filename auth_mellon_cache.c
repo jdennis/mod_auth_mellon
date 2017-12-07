@@ -25,792 +25,1025 @@
 APLOG_USE_MODULE(auth_mellon);
 #endif
 
-/* Calculate the pointer to a cache entry.
+/*---------------------------------- Defines ---------------------------------*/
+
+#define NAMEID_ENTRY_SIZE 512
+#define DIAG_DIR_ENTRY_SIZE 16
+
+#define SESSION_KEY_PREFIX "session_id"
+#define NAMEID_KEY_PREFIX "name_id"
+#define DIAG_DIR_KEY_PREFIX "diag_dir"
+
+/*--------------------------------- Prototypes -------------------------------*/
+/*----------------------------- Internal Functions ---------------------------*/
+
+/**
+ * Generate key to lookup session by name_id
  *
- * Parameters:
- *  am_mod_cfg_rec *mod_cfg  The module configuration.
- *  void *table              The base pointer for the table.
- *  apr_size_t index         The index we are looking for.
+ * We need to be able to lookup a session given a name_id. The obvious
+ * choice of a key is the string representation of a LassoSaml2NameID
+ * object (i.e. it's XML text representation). However the size of the
+ * XML text representation of a LassoSaml2NameID is often at least
+ * several hundred bytes. Severl socache providers have limitations on
+ * the size of keys they can accept (memcache being a good
+ * example). Therefore we need to derive a key that will be unique to
+ * the NameID but be short enough.
  *
- * Returns:
- *  The session entry with the given index.
+ * A good choice for a short key would be a hash digest of the
+ * NameID data.
+ *
+ * We must also be careful to avoid namespace collisions,
+ * our cache may be storing NameID's from multiple IdP's. A name
+ * collision would occur if the name was not qualified with a
+ * namespace. SAML anticipates this by providing the NameQualifier,
+ * SPNameQualifier and SPProvidedID optional elements in the NameID.
+ *
+ * Taking the digest of the string representation of the complete
+ * NameID would capture all the qualifiers. But then we are dependent
+ * upon the sending party to send exactly the same NameID data
+ * everytime. In theory it should but we would like to be more robust
+ * and not depend upon an optional attribute being sent one time and
+ * omitted another. But more importantly the NameID may not have any
+ * qualifiers specified at all. Simply taking the hash of the
+ * presented NameID will not be robust. If we compute a different hash
+ * than the one it was stored under we will fail the lookup.
+ *
+ * Therefore we form a string from pieces of the NameID data and use
+ * that string to generate a hash from. The string is:
+ *
+ * namespace|format|name
+ *
+ * where | is the string concatenation operator. The above is called
+ * the "compendium".
+ *
+ * If the NameID included a NameQualifier element we utilize that as
+ * the namespace value to disambiguate the name, otherwise we use the
+ * name of the Issuer as the namespace value. This should be enough to
+ * avoid name collisions. The name format is critical to interpreting
+ * the name and as such is essential component to avoid name
+ * collisions (e.g. two identical names but with different name
+ * formats are two uniquely different names)
+ *
+ * After the compendium is formed a SHA256 digest is computed from it
+ * and converted to a hexidecimal string representation. This is our key. 
+ *
+ * @param[in] r             Current HTTP request
+ * @param[in] lasso_name_id The NameID object whose lookup key is
+ *                          being computed.
+ * @oaran[in] issuer        The NameID object of the entity that
+ *                          issued the NameID.
+ *
+ * @returns
  */
-static inline am_cache_entry_t *am_cache_entry_ptr(am_mod_cfg_rec *mod_cfg,
-                                                   void *table, apr_size_t index)
+static const char *
+am_nameid_key(request_rec *r, LassoSaml2NameID *lasso_name_id,
+              LassoSaml2NameID *issuer)
 {
-    uint8_t *table_calc;
-    table_calc = table;
-    return (am_cache_entry_t *)&table_calc[mod_cfg->init_entry_size * index];
-}
+    const char *namespace;
+    const char *format;
+    const char *name_id;
+    const char *compendium;
+    const char *key;
 
-/* Initialize the session table.
- *
- * Parameters:
- *  am_mod_cfg_rec *mod_cfg  The module configuration.
- *
- * Returns:
- *  Nothing.
- */
-void am_cache_init(am_mod_cfg_rec *mod_cfg)
-{
-    void *table;
-    apr_size_t i;
-    /* Initialize the session table. */
-    table = apr_shm_baseaddr_get(mod_cfg->cache);
-    for (i = 0; i < mod_cfg->init_cache_size; i++) {
-        am_cache_entry_t *e = am_cache_entry_ptr(mod_cfg, table, i);
-        e->key[0] = '\0';
-        e->access = 0;
-    }
-}
-
-/* This function locks the session table and locates a session entry.
- * Unlocks the table and returns NULL if the entry wasn't found.
- * If a entry was found, then you _must_ unlock it with am_cache_unlock
- * after you are done with it.
- *
- * Parameters:
- *  request_rec *r       The request we are processing.
- *  am_cache_key_t type  AM_CACHE_SESSION or AM_CACHE_NAMEID
- *  const char *key      The session key or user
- *
- * Returns:
- *  The session entry on success or NULL on failure.
- */
-am_cache_entry_t *am_cache_lock(request_rec *r, 
-                                am_cache_key_t type,
-                                const char *key)
-{
-    am_mod_cfg_rec *mod_cfg;
-    void *table;
-    apr_size_t i;
-    int rv;
-    char buffer[512];
-
-
-    /* Check if we have a valid session key. We abort if we don't. */
-    if (key == NULL)
-        return NULL;
-
-    switch (type) {
-    case AM_CACHE_SESSION:
-        if (strlen(key) != AM_ID_LENGTH)
-            return NULL;
-        break;
-    case AM_CACHE_NAMEID:
-        break;
-    default:
-        return NULL;
-        break;
-    }
-
-    mod_cfg = am_get_mod_cfg(r->server);
-
-
-    /* Lock the table. */
-    if((rv = apr_global_mutex_lock(mod_cfg->lock)) != APR_SUCCESS) {
+    if (lasso_name_id == NULL) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "apr_global_mutex_lock() failed [%d]: %s",
-                      rv, apr_strerror(rv, buffer, sizeof(buffer)));
+                      "lasso_name_id is NULL");
         return NULL;
     }
 
-    table = apr_shm_baseaddr_get(mod_cfg->cache);
-
-
-    for(i = 0; i < mod_cfg->init_cache_size; i++) {
-        am_cache_entry_t *e = am_cache_entry_ptr(mod_cfg, table, i);
-        const char *tablekey;
-
-        if (e->key[0] == '\0') {
-            /* This entry is empty. Skip it. */
-            continue;
-        }
-
-        switch (type) {
-        case AM_CACHE_SESSION:
-            tablekey = e->key;
-            break;
-        case AM_CACHE_NAMEID:
-            /* tablekey may be NULL */
-            tablekey = am_cache_env_fetch_first(e, "NAME_ID");
-            break;
-        default:
-            tablekey = NULL;
-            break;
-        }
-
-        if (tablekey == NULL)
-            continue;
-
-        if(strcmp(tablekey, key) == 0) {
-            apr_time_t now = apr_time_now();
-            /* We found the entry. */
-            if(e->expires > now) {
-                /* And it hasn't expired. */
-                return e;
-            }
-            else {
-                am_diag_log_cache_entry(r, 0, e,
-                                        "found expired session, now %s\n",
-                                        am_diag_time_t_to_8601(r, now));
-            }
-        }
-    }
-
-
-    /* We didn't find a entry matching the key. Unlock the table and
-     * return NULL;
-     */
-    apr_global_mutex_unlock(mod_cfg->lock);
-    return NULL;
-}
-
-static inline bool am_cache_entry_slot_is_empty(am_cache_storage_t *slot)
-{
-    return (slot->ptr == 0);
-}
-
-static inline void am_cache_storage_null(am_cache_storage_t *slot)
-{
-    slot->ptr = 0;
-}
-
-static inline void am_cache_entry_env_null(am_cache_entry_t *e)
-{
-    for (int i = 0; i < AM_CACHE_ENVSIZE; i++) {
-        am_cache_storage_null(&e->env[i].varname);
-        am_cache_storage_null(&e->env[i].value);
-    }
-}
-
-static inline apr_size_t am_cache_entry_pool_left(am_cache_entry_t *e)
-{
-    return e->pool_size - e->pool_used;
-}
-
-static inline apr_size_t am_cache_entry_pool_size(am_mod_cfg_rec *cfg)
-{
-    return cfg->init_entry_size - sizeof(am_cache_entry_t);
-}
-
-/* This function sets a string into the specified storage on the entry.
- *
- * NOTE: The string pointer may be NULL, in that case storage is freed
- * and set to NULL.
- *
- * Parametrs:
- *  am_cache_entry_t *entry         Pointer to an entry
- *  am_cache_storage_t *slot        Pointer to storage
- *  const char *string              Pointer to a replacement string
- *
- * Returns:
- *  0 on success, HTTP_INTERNAL_SERVER_ERROR on error.
- */
-static int am_cache_entry_store_string(am_cache_entry_t *entry,
-                                       am_cache_storage_t *slot,
-                                       const char *string)
-{
-    char *datastr = NULL;
-    apr_size_t datalen = 0;
-    apr_size_t str_len = 0;
-
-    if (string == NULL) return 0;
-
-    if (slot->ptr != 0) {
-        datastr = &entry->pool[slot->ptr];
-        datalen = strlen(datastr) + 1;
-    }
-    str_len = strlen(string) + 1;
-    if (str_len - datalen <= 0) {
-        memcpy(datastr, string, str_len);
-        return 0;
-    }
-
-    /* recover space if slot happens to point to the last allocated space */
-    if (slot->ptr + datalen == entry->pool_used) {
-        entry->pool_used -= datalen;
-        slot->ptr = 0;
-    }
-
-    if (am_cache_entry_pool_left(entry) < str_len) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "apr_cache_entry_store_string() asked %zd available: %zd. "
-                     "It may be a good idea to increase MellonCacheEntrySize.",
-                     str_len, am_cache_entry_pool_left(entry));
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    slot->ptr = entry->pool_used;
-    datastr = &entry->pool[slot->ptr];
-    memcpy(datastr, string, str_len);
-    entry->pool_used += str_len;
-    return 0;
-}
-
-/* Returns a pointer to the string in the storage slot specified
- *
- *
- * Parametrs:
- *  am_cache_entry_t *entry         Pointer to an entry
- *  am_cache_storage_t *slot        Pointer to storage slot
- *
- * Returns:
- *  A string or NULL if the slot is empty.
- */
-const char *am_cache_entry_get_string(am_cache_entry_t *e,
-                                      am_cache_storage_t *slot)
-{
-    char *ret = NULL;
-
-    if (slot->ptr != 0) {
-        ret = &e->pool[slot->ptr];
-    }
-
-    return ret;
-}
-
-/* This function locks the session table and creates a new session entry.
- * It will first attempt to locate a free session. If it doesn't find a
- * free session, then it will take the least recentry used session.
- *
- * Remember to unlock the table with am_cache_unlock(...) afterwards.
- *
- * Parameters:
- *  request_rec *r       The request we are processing.
- *  const char *key      The key of the session to allocate.
- *  const char *cookie_token  The cookie token to tie the session to.
- *
- * Returns:
- *  The new session entry on success. NULL if key is a invalid session
- *  key.
- */
-am_cache_entry_t *am_cache_new(request_rec *r,
-                               const char *key,
-                               const char *cookie_token)
-{
-    am_cache_entry_t *t;
-    am_mod_cfg_rec *mod_cfg;
-    void *table;
-    apr_time_t current_time;
-    int i;
-    apr_time_t age;
-    int rv;
-    char buffer[512];
-
-    /* Check if we have a valid session key. We abort if we don't. */
-    if(key == NULL || strlen(key) != AM_ID_LENGTH) {
-        return NULL;
-    }
-
-
-    mod_cfg = am_get_mod_cfg(r->server);
-
-
-    /* Lock the table. */
-    if((rv = apr_global_mutex_lock(mod_cfg->lock)) != APR_SUCCESS) {
-        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "apr_global_mutex_lock() failed [%d]: %s",
-                      rv, apr_strerror(rv, buffer, sizeof(buffer)));
-        return NULL;
-    }
-
-    table = apr_shm_baseaddr_get(mod_cfg->cache);
-
-    /* Get current time. If we find a entry with expires <= the current
-     * time, then we can use it.
-     */
-    current_time = apr_time_now();
-
-    /* We will use 't' to remember the best/oldest entry. We
-     * initalize it to the first entry in the table to simplify the
-     * following code (saves test for t == NULL).
-     */
-    t = am_cache_entry_ptr(mod_cfg, table, 0);
-
-    /* Iterate over the session table. Update 't' to match the "best"
-     * entry (the least recently used). 't' will point a free entry
-     * if we find one. Otherwise, 't' will point to the least recently
-     * used entry.
-     */
-    for(i = 0; i < mod_cfg->init_cache_size; i++) {
-        am_cache_entry_t *e = am_cache_entry_ptr(mod_cfg, table, i);
-        if (e->key[0] == '\0') {
-            /* This entry is free. Update 't' to this entry
-             * and exit loop.
-             */
-            t = e;
-            break;
-        }
-
-        if (e->expires <= current_time) {
-            /* This entry is expired, and is therefore free.
-             * Update 't' and exit loop.
-             */
-            t = e;
-            am_diag_log_cache_entry(r, 0, e,
-                                    "%s ejecting expired sessions, now %s\n",
-                                    __func__,
-                                    am_diag_time_t_to_8601(r, current_time));
-            break;
-        }
-
-        if (e->access < t->access) {
-            /* This entry is older than 't' - update 't'. */
-            t = e;
-        }
-    }
-
-
-    if(t->key[0] != '\0' && t->expires > current_time) {
-        /* We dropped a LRU entry. Calculate the age in seconds. */
-        age = (current_time - t->access) / 1000000;
-
-        if(age < 3600) {
-            AM_LOG_RERROR(APLOG_MARK, APLOG_NOTICE, 0, r,
-                          "Dropping LRU entry entry with age = %" APR_TIME_T_FMT
-                          "s, which is less than one hour. It may be a good"
-                          " idea to increase MellonCacheSize.",
-                          age);
-        }
-    }
-
-    /* Now 't' points to the entry we are going to use. We initialize
-     * it and returns it.
-     */
-
-    strcpy(t->key, key);
-
-    /* Far far into the future. */
-    t->expires = 0x7fffffffffffffffLL;
-
-    t->logged_in = 0;
-    t->size = 0;
-
-    am_cache_storage_null(&t->cookie_token);
-    am_cache_storage_null(&t->user);
-    am_cache_storage_null(&t->lasso_identity);
-    am_cache_storage_null(&t->lasso_session);
-    am_cache_storage_null(&t->lasso_saml_response);
-    am_cache_entry_env_null(t);
-
-    t->pool_size = am_cache_entry_pool_size(mod_cfg);
-    t->pool[0] = '\0';
-    t->pool_used = 1;
-
-    rv = am_cache_entry_store_string(t, &t->cookie_token, cookie_token);
-    if (rv != 0) {
-        /* For some strange reason our cookie token is too big to fit in the
-         * session. This should never happen outside of absurd configurations.
-         */
-        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "Unable to store cookie token in new session.");
-        t->key[0] = '\0'; /* Mark the entry as free. */
-        apr_global_mutex_unlock(mod_cfg->lock);
-        return NULL;
-    }
-
-    am_diag_printf(r, "%s created new session, id=%s at %s"
-                   " cookie_token=\"%s\"\n",
-                   __func__, t->key, am_diag_time_t_to_8601(r, current_time),
-                   cookie_token);
-
-    return t;
-}
-
-
-/* This function unlocks a session entry.
- *
- * Parameters:
- *  request_rec *r           The request we are processing.
- *  am_cache_entry_t *entry  The session entry.
- *
- * Returns:
- *  Nothing.
- */
-void am_cache_unlock(request_rec *r, am_cache_entry_t *entry)
-{
-    am_mod_cfg_rec *mod_cfg;
-
-    /* Update access time. */
-    entry->access = apr_time_now();
-
-    mod_cfg = am_get_mod_cfg(r->server);
-    apr_global_mutex_unlock(mod_cfg->lock);
-}
-
-
-/* This function updates the expire-timestamp of a session, if the new
- * timestamp is earlier than the previous.
- *
- * Parameters:
- *  request_rec *r        The request we are processing.
- *  am_cache_entry_t *t   The current session.
- *  apr_time_t expires    The new timestamp.
- *
- * Returns:
- *  Nothing.
- */
-void am_cache_update_expires(request_rec *r, am_cache_entry_t *t, apr_time_t expires)
-{
-    /* Check if we should update the expires timestamp. */
-    if(t->expires == 0 || t->expires > expires) {
-        t->expires = expires;
-    }
-}
-
-
-/* This function appends a name-value pair to a session. It is possible to
- * store several values with the same name. This is the method used to store
- * multivalued fields.
- *
- * Parameters:
- *  am_cache_entry_t *t  The current session.
- *  const char *var      The name of the value to be stored.
- *  const char *val      The value which should be stored in the session.
- *
- * Returns:
- *  OK on success or HTTP_INTERNAL_SERVER_ERROR on failure.
- */
-int am_cache_env_append(am_cache_entry_t *t,
-                        const char *var, const char *val)
-{
-    int status;
-
-    /* Make sure that the name and value will fit inside the
-     * fixed size buffer.
-     */
-    if(t->size >= AM_CACHE_ENVSIZE) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "Unable to store attribute value because we have"
-                     " reached the maximum number of name-value pairs for"
-                     " this session. The maximum number is %d.",
-                     AM_CACHE_ENVSIZE);
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    status = am_cache_entry_store_string(t, &t->env[t->size].varname, var);
-    if (status != 0) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "Unable to store session data because there is no more "
-                     "space in the session. Attribute Name = \"%s\".", var);
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    status = am_cache_entry_store_string(t, &t->env[t->size].value, val);
-    if (status != 0) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "Unable to store session data because there is no more "
-                     "space in the session. Attribute Value = \"%s\".", val);
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    t->size++;
-
-    return OK;
-}
-
-/* This function fetches a value from a session.
- * If multiple values are available, the first one is returned.
- *
- * Parameters:
- *  am_cache_entry_t *t  The current session.
- *  const char *var      The name of the value to be stored.
- *
- * Returns:
- *  The first value, NULL if it does not exist.
- */
-const char *am_cache_env_fetch_first(am_cache_entry_t *t,
-                                     const char *var)
-{
-    const char *str;
-    int i;
-
-    for (i = 0; i < t->size; i++) {
-        str = am_cache_entry_get_string(t, &t->env[i].varname);
-        if (str == NULL)
-            break;
-        if (strcmp(str, var) == 0)
-            return am_cache_entry_get_string(t, &t->env[i].value);
-    }
-
-    return NULL;
-}
-
-
-/* This function populates the subprocess environment with data received
- * from the IdP.
- *
- * Parameters:
- *  request_rec *r       The request we should add the data to.
- *  am_cache_entry_t *t  The session data.
- *
- * Returns:
- *  Nothing.
- */
-void am_cache_env_populate(request_rec *r, am_cache_entry_t *t)
-{
-    am_dir_cfg_rec *d;
-    int i;
-    apr_hash_t *counters;
-    am_envattr_conf_t *env_varname_conf;
-    const char *varname;
-    const char *varname_prefix;
-    const char *value;
-    const char *prefixed_varname;
-    int *count;
-    int status;
-
-    d = am_get_dir_cfg(r);
-
-    /* Check if the user attribute has been set, and set it if it
-     * hasn't been set. */
-    if (am_cache_entry_slot_is_empty(&t->user)) {
-        for(i = 0; i < t->size; ++i) {
-            varname = am_cache_entry_get_string(t, &t->env[i].varname);
-            if (strcasecmp(varname, d->userattr) == 0) {
-                value = am_cache_entry_get_string(t, &t->env[i].value);
-                status = am_cache_entry_store_string(t, &t->user, value);
-                if (status != 0) {
-                    AM_LOG_RERROR(APLOG_MARK, APLOG_NOTICE, 0, r,
-                                  "Unable to store the user name because there"
-                                  " is no more space in the session. "
-                                  "Username = \"%s\".", value);
-                }
-            }
-        }
-    }
-
-    /* Allocate a set of counters for duplicate variables in the list. */
-    counters = apr_hash_make(r->pool);
-
-    /* Populate the subprocess environment with the attributes we
-     * received from the IdP.
-     */
-    for(i = 0; i < t->size; ++i) {
-        varname = am_cache_entry_get_string(t, &t->env[i].varname);
-        varname_prefix = "MELLON_";
-
-        /* Check if we should map this name into another name. */
-        env_varname_conf = (am_envattr_conf_t *)apr_hash_get(
-            d->envattr, varname, APR_HASH_KEY_STRING);
-
-        if(env_varname_conf != NULL) {
-            varname = env_varname_conf->name;
-            if (!env_varname_conf->prefixed) {
-              varname_prefix = "";
-            }
-        }
-
-        value = am_cache_entry_get_string(t, &t->env[i].value);
-
-        /*  
-         * If we find a variable remapping to MellonUser, use it.
-         */
-        if (am_cache_entry_slot_is_empty(&t->user) &&
-            (strcasecmp(varname, d->userattr) == 0)) {
-            status = am_cache_entry_store_string(t, &t->user, value);
-            if (status != 0) {
-                AM_LOG_RERROR(APLOG_MARK, APLOG_NOTICE, 0, r,
-                              "Unable to store the user name because there"
-                              " is no more space in the session. "
-                              "Username = \"%s\".", value);
-            }
-        }
-
-        prefixed_varname = apr_pstrcat(r->pool, varname_prefix, varname, NULL);
-
-        /* Find the number of times this variable has been set. */
-        count = apr_hash_get(counters, varname, APR_HASH_KEY_STRING);
-        if(count == NULL) {
-
-            /* This is the first time. Create a counter for this variable. */
-            count = apr_palloc(r->pool, sizeof(int));
-            *count = 0;
-            apr_hash_set(counters, varname, APR_HASH_KEY_STRING, count);
-
-            /* Add the variable without a suffix. */
-            apr_table_set(r->subprocess_env,prefixed_varname,value);
-        }
-
-        /* Check if merging of environment variables is disabled.
-         * This is either if it is NULL (default value if not configured
-         * by user) or an empty string (if specifically disabled by the user).
-         */
-        if (d->merge_env_vars == NULL || *d->merge_env_vars == '\0') {
-         
-            /* Add the variable with a suffix indicating how many times it has
-             * been added before.
-             */
-            apr_table_set(r->subprocess_env,
-                          apr_psprintf(r->pool, "%s_%d", prefixed_varname,
-                              (d->env_vars_index_start > -1
-                                  ? *count + d->env_vars_index_start
-                                  : *count)),
-                          value);
-
-        } else if (*count > 0) {
-
-            /*
-             * Merge multiple values, separating by default with ";"
-             * this makes auth_mellon work same way mod_shib is:
-             * https://wiki.shibboleth.net/confluence/display/SHIB2/NativeSPAttributeAccess
-             */
-             apr_table_set(r->subprocess_env,
-                           prefixed_varname,
-                           apr_pstrcat(r->pool, 
-                                       apr_table_get(r->subprocess_env,prefixed_varname),
-                                       d->merge_env_vars, value, NULL));
-        }
-          
-        /* Increase the count. */
-        ++(*count);
-
-        if (d->env_vars_count_in_n > 0) {
-             apr_table_set(r->subprocess_env,
-                           apr_pstrcat(r->pool, prefixed_varname, "_N", NULL),
-                           apr_itoa(r->pool, *count));
-        }
-    }
-
-    if (!am_cache_entry_slot_is_empty(&t->user)) {
-        /* We have a user-"name". Set r->user and r->ap_auth_type. */
-        r->user = apr_pstrdup(r->pool, am_cache_entry_get_string(t, &t->user));
-        r->ap_auth_type = apr_pstrdup(r->pool, "Mellon");
+    if (lasso_name_id->Format != NULL) {
+        format = lasso_name_id->Format;
     } else {
-        /* We don't have a user-"name". Log error. */
-        AM_LOG_RERROR(APLOG_MARK, APLOG_NOTICE, 0, r,
-                      "Didn't find the attribute \"%s\" in the attributes"
-                      " which were received from the IdP. Cannot set a user"
-                      " for this request without a valid user attribute.",
-                      d->userattr);
+        format = LASSO_SAML2_NAME_IDENTIFIER_FORMAT_UNSPECIFIED;
     }
 
-
-    /* Populate with the session? */
-    if (d->dump_session) {
-        char *session;
-        const char *srcstr;
-        int srclen, dstlen;
-
-        srcstr = am_cache_entry_get_string(t, &t->lasso_session);
-        srclen = strlen(srcstr);
-        dstlen = apr_base64_encode_len(srclen);
-
-        session = apr_palloc(r->pool, dstlen);
-        (void)apr_base64_encode(session, srcstr, srclen);
-        apr_table_set(r->subprocess_env, "MELLON_SESSION", session);
-    }
-
-    if (d->dump_saml_response) {
-        const char *sr = am_cache_entry_get_string(t, &t->lasso_saml_response);
-        if (sr) {
-            apr_table_set(r->subprocess_env, "MELLON_SAML_RESPONSE", sr);
+    if (lasso_name_id->NameQualifier != NULL) {
+        namespace = lasso_name_id->NameQualifier;
+    } else {
+        if (issuer != NULL) {
+            if (issuer->content != NULL) {
+                namespace = issuer->content;
+            } else {
+                AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
+                              "name id \"%s\" omitted a name space qualifier "
+                              "and the Issuer name id content was NULL. Thus "
+                              "the name id is ambiguous because it cannot "
+                              "be qualified by Issuer and may collide with "
+                              "other unqualified names.",
+                              lasso_name_id->content);
+                namespace = "<NULL>";
+            }
+        } else {
+            AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
+                          "name id \"%s\" omitted a name space qualifier, "
+                          "and no Issuer was provided. Thus "
+                          "the name id is ambiguous because it cannot "
+                          "be qualified by Issuer and may collide with "
+                          "other unqualified names.",
+                          lasso_name_id->content);
+            namespace = "<NULL>";
         }
     }
+
+    if (lasso_name_id->content == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "lasso_name_id content is empty");
+        return NULL;
+    } else {
+        name_id = lasso_name_id->content;
+    }
+
+    compendium = apr_pstrcat(r->pool,
+                             namespace,
+                             format,
+                             name_id,
+                             NULL);
+    key = am_sha256_sum(r, (unsigned char *)compendium, strlen(compendium));
+
+    am_diag_log_lasso_node(r, 0, (LassoNode *)lasso_name_id,
+                           "compute name_id key, key=%s compendium=%s name_id:",
+                           key, compendium);
+
+    return key;
 }
 
-
-/* This function deletes a given key from the session store.
- *
- * Parameters:
- *  request_rec *r            The request we are processing.
- *  am_cache_entry_t *cache   The entry we are deleting.
- *
- * Returns:
- *  Nothing.
+/*
+ * These key_name() functions exist to enforce a namespace in the
+ * cache. The opportunity to store an unintended value under a key
+ * name is a potential attack vector we need to guard against. We do
+ * this by assuring each type of data stored in the cache is
+ * independent of any other data type, hence a key can only access
+ * it's own data type and all keys withing a data type have a unique
+ * key.
  */
-void am_cache_delete(request_rec *r, am_cache_entry_t *cache)
+
+static const char *
+session_key_name(request_rec *r, const char *session_id)
 {
-    /* We write a null-byte at the beginning of the key to
-     * mark this slot as unused. 
+    return apr_psprintf(r->pool, "%s:%s", SESSION_KEY_PREFIX, session_id);
+}
+
+static const char *
+name_id_key_name(request_rec *r, LassoSaml2NameID *name_id,
+                 LassoSaml2NameID *issuer)
+{
+    const char *key = NULL;
+
+    key = am_nameid_key(r, name_id, issuer);
+
+    if (key == NULL) {
+        return NULL;
+    }
+    return apr_psprintf(r->pool, "%s:%s", NAMEID_KEY_PREFIX, key);
+}
+
+/*------------------------------ Public Functions ----------------------------*/
+
+static apr_status_t
+am_destroy_socache(server_rec *s)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(s);
+
+    if (mod_cfg->socache_instance) {
+        mod_cfg->socache_provider->destroy(mod_cfg->socache_instance, s);
+        mod_cfg->socache_instance = NULL;
+    }
+    return APR_SUCCESS;
+}
+
+static apr_status_t
+am_destroy_socache_lock(server_rec *s)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(s);
+
+    if (mod_cfg->socache_lock) {
+        apr_global_mutex_destroy(mod_cfg->socache_lock);
+        mod_cfg->socache_lock = NULL;
+    }
+    return APR_SUCCESS;
+}
+
+static apr_status_t
+destroy_socache_callback(void *data)
+{
+    server_rec *s = (server_rec *)data;
+
+    return am_destroy_socache(s);
+}
+
+static apr_status_t
+destroy_socache_lock_callback(void *data)
+{
+    server_rec *s = (server_rec *)data;
+
+    return am_destroy_socache_lock(s);
+}
+
+apr_status_t
+am_get_socache_provider(apr_pool_t *pool, const char *name,
+                        ap_socache_provider_t **socache_provider_out,
+                        const char **errmsg_out)
+{
+    apr_status_t apr_status = APR_SUCCESS;
+    ap_socache_provider_t *socache_provider = NULL;
+
+    *socache_provider_out = NULL;
+    if (errmsg_out) {
+        *errmsg_out = NULL;
+    }
+
+    socache_provider = ap_lookup_provider(AP_SOCACHE_PROVIDER_GROUP,
+                                          name,
+                                          AP_SOCACHE_PROVIDER_VERSION);
+    if (socache_provider == NULL) {
+        apr_status = APR_NOTFOUND;
+        if (errmsg_out) {
+            char *errmsg = NULL;
+            apr_array_header_t *name_list;
+            const char *all_names;
+
+            /* Build a comma-separated list of all registered provider names: */
+            name_list = ap_list_provider_names(pool,
+                                               AP_SOCACHE_PROVIDER_GROUP,
+                                               AP_SOCACHE_PROVIDER_VERSION);
+            all_names = apr_array_pstrcat(pool, name_list, ',');
+
+            errmsg = apr_psprintf(pool,
+                                  "'%s' session socache not supported "
+                                  "(known names: %s). "
+                                  "Maybe you need to load the appropriate "
+                                  "socache module (mod_socache_%s?).",
+                                  name, all_names, name);
+            *errmsg_out = errmsg;
+        }
+        return apr_status;
+    }
+    
+    *socache_provider_out = socache_provider;
+    return apr_status;
+}
+
+apr_status_t
+am_socache_init(apr_pool_t *pool, apr_pool_t *tmp_pool, server_rec *s)
+{
+    apr_status_t apr_status;
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(s);
+    struct ap_socache_hints socache_hints;
+    const char *errmsg = NULL;
+
+    memset(&socache_hints, 0, sizeof socache_hints);
+    socache_hints.avg_id_len = AM_ID_LENGTH;
+    socache_hints.avg_obj_size = mod_cfg->socache_session_state_entry_size;;
+    socache_hints.expiry_interval = 60000000;
+
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s,
+                 "initializing socache provider_name=\"%s\" "
+                 "provider_args=\"%s\" session_state_entry_size=%d",
+                 mod_cfg->socache_provider_name,
+                 mod_cfg->socache_provider_args,
+                 mod_cfg->socache_session_state_entry_size);
+
+    if (mod_cfg->socache_provider == NULL) {
+        apr_status = am_get_socache_provider(pool,
+                                             mod_cfg->socache_provider_name,
+                                             &mod_cfg->socache_provider,
+                                             &errmsg);
+        if (apr_status != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                         "failed loading socache "
+                         "provider_name=%s provider_args=%s errmsg=%s",
+                         mod_cfg->socache_provider_name,
+                         mod_cfg->socache_provider_args, errmsg);
+            return apr_status;
+        }
+    }
+
+    if (mod_cfg->socache_instance == NULL) {
+        errmsg = mod_cfg->socache_provider->create(&mod_cfg->socache_instance,
+                                                   mod_cfg->socache_provider_args,
+                                                   tmp_pool, pool);
+        if (errmsg) {
+            apr_status = APR_EGENERAL;
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                         "failed to create socache provider "
+                         "provider_name=%s provider_args=%s errmsg=%s",
+                         mod_cfg->socache_provider_name,
+                         mod_cfg->socache_provider_args, errmsg);
+            return apr_status;
+        }
+    }
+
+    if (mod_cfg->socache_provider->flags & AP_SOCACHE_FLAG_NOTMPSAFE) {
+        apr_status = ap_global_mutex_create(&mod_cfg->socache_lock,
+                                            NULL, SOCACHE_ID,
+                                            NULL, s, pool, 0);
+
+        if (apr_status != APR_SUCCESS) {
+            char buffer[512];
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                         "mutex_create: Error [%d] \"%s\"",
+                         apr_status, apr_strerror(apr_status,
+                                                  buffer, sizeof(buffer)));
+            return apr_status;
+        }
+
+        apr_pool_cleanup_register(pool, (void*)s, destroy_socache_lock_callback,
+                                  apr_pool_cleanup_null);
+#ifdef AP_NEED_SET_MUTEX_PERMS
+        /* On some platforms the mutex is implemented as a file. To
+         * allow child processes running as a different user to open
+         * it, it is necessary to change the permissions on it. */
+        apr_status = ap_unixd_set_global_mutex_perms(mod_cfg->socache_lock);
+        if (apr_status != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                         "Failed to set permissions on session lock, "
+                         " check User and Group directives");
+            return apr_status;
+        }
+#endif
+
+    }
+
+    apr_status = mod_cfg->socache_provider->init(mod_cfg->socache_instance,
+                                         SOCACHE_ID, &socache_hints, s, pool);
+    if (apr_status != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "failed to initialise %s cache", SOCACHE_ID);
+        return apr_status;
+    }
+    apr_pool_cleanup_register(pool, (void*)s, destroy_socache_callback,
+                              apr_pool_cleanup_null);
+    return APR_SUCCESS;
+}
+
+apr_status_t am_cache_aquire_lock(request_rec *r)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    apr_status_t rv = APR_SUCCESS;
+
+    if (socache_provider->flags & AP_SOCACHE_FLAG_NOTMPSAFE) {
+        if ((rv = apr_global_mutex_lock(mod_cfg->socache_lock)) != APR_SUCCESS) {
+            char error_buf[512];
+            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                          "apr_global_mutex_lock() failed [%d]: %s",
+                          rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return rv;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+apr_status_t am_cache_release_lock(request_rec *r)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    apr_status_t rv = APR_SUCCESS;
+
+    if (socache_provider->flags & AP_SOCACHE_FLAG_NOTMPSAFE) {
+        if ((rv = apr_global_mutex_unlock(mod_cfg->socache_lock)) != APR_SUCCESS) {
+            char error_buf[512];
+            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                          "apr_global_mutex_unlock() failed [%d]: %s",
+                          rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return rv;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+static const char *
+am_cache_load_session_id_from_name_id(request_rec *r, LassoSaml2NameID *name_id,
+                                      LassoSaml2NameID *issuer)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *name_id_key = name_id_key_name(r, name_id, issuer);
+    unsigned int name_id_key_len = strlen(name_id_key);
+    apr_status_t rv = APR_SUCCESS;
+
+    unsigned int entry_buf_len = NAMEID_ENTRY_SIZE;
+    char *entry_buf = NULL;
+
+    am_diag_printf(r, "%s: name_id=%s name_id_key=%s name_id_key_len=%u "
+                   "now=%s\n",
+                   __func__,
+                   am_lasso_name_id_string(r, name_id),
+                   name_id_key, name_id_key_len,
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if (name_id == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "name_id was NULL");
+        return NULL;
+    }
+
+    entry_buf = apr_palloc(r->pool, entry_buf_len + 1);
+    if (entry_buf == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to allocate session_id buffer");
+        return NULL;
+    }
+
+    rv = socache_provider->retrieve(socache_instance, r->server,
+                                    (const unsigned char *)name_id_key,
+                                    name_id_key_len,
+                                    (unsigned char *)entry_buf, &entry_buf_len,
+                                    r->pool);
+    if (rv == APR_NOTFOUND) {
+        am_diag_printf(r, "%s: name_id not found, name_id=%s now=%s\n",
+                       __func__,
+                       am_lasso_name_id_string(r, name_id),
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        return NULL;
+    } else if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to retrieve name_id=%s now=%s error=[%d]: %s",
+                      am_lasso_name_id_string(r, name_id),
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return NULL;
+    }
+
+    entry_buf[entry_buf_len] = '\0'; /* NULL-terminate */
+
+    am_diag_printf(r, "%s: successfully retrieved %u bytes\n",
+                   __func__, entry_buf_len);
+
+    return entry_buf;
+}
+
+static const char *
+am_cache_load_session_xml_from_session_id(request_rec *r, const char *session_id)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *session_key = session_key_name(r, session_id);
+    unsigned int session_key_len = strlen(session_key);
+    apr_status_t rv = APR_SUCCESS;
+
+    unsigned int entry_buf_len = mod_cfg->socache_session_state_entry_size;
+    char *entry_buf = NULL;
+
+    am_diag_printf(r, "%s: session_id=%s "
+                   "session_id_key=%s session_id_key_len=%u "
+                   "now=%s\n",
+                   __func__, session_id,
+                   session_key, session_key_len,
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if (session_id == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "session_id was NULL");
+        return NULL;
+    }
+
+    entry_buf = apr_palloc(r->pool, entry_buf_len + 1);
+    if (entry_buf == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to allocate session xml buffer");
+        return NULL;
+    }
+
+    rv = socache_provider->retrieve(socache_instance, r->server,
+                                    (const unsigned char *)session_key,
+                                    session_key_len,
+                                    (unsigned char *)entry_buf, &entry_buf_len,
+                                    r->pool);
+
+    if (rv == APR_NOTFOUND) {
+        am_diag_printf(r, "%s: session not found using session_id=%s now=%s\n",
+                       __func__, session_id,
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        return NULL;
+    } else if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to retrieve session_id=%s now=%s error=[%d]: %s",
+                      session_id,
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return NULL;
+    }
+
+    entry_buf[entry_buf_len] = '\0'; /* NULL-terminate */
+
+    am_diag_printf(r, "%s: successfully retrieved %u bytes\n",
+                   __func__, entry_buf_len);
+
+    return entry_buf;
+}
+
+static apr_status_t
+am_cache_store_name_id_entry(request_rec *r,
+                             const char *session_id,
+                             LassoSaml2NameID *name_id,
+                             LassoSaml2NameID *issuer,
+                             apr_time_t expiration)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *name_id_key = name_id_key_name(r, name_id, issuer);
+    unsigned int name_id_key_len = strlen(name_id_key);
+    unsigned int data_len = strlen(session_id);
+    apr_status_t rv = APR_SUCCESS;
+
+    /*
+     * retrieve will fail if it's not provided with a buffer big
+     * enough to receive the data. Worse is the fact the error from
+     * some socache providers when the return buffer is too small is
+     * APR_NOTFOUND which is not the real reason.
      */
-    cache->key[0] = '\0';
 
-    /* Unlock the entry. */
-    am_cache_unlock(r, cache);
-}
+    am_diag_printf(r, "%s: name_id=\"%s\" name_id_key=%s name_id_key_len=%u "
+                   "expiration=%s now=%s "
+                   "data_len=%u data=\"%s\" \n", __func__, 
+                   am_lasso_name_id_string(r, name_id),
+                   name_id_key, name_id_key_len,
+                   am_time_t_to_8601(r->pool, expiration),
+                   am_time_t_to_8601(r->pool, apr_time_now()),
+                   data_len, session_id);
 
-
-/* This function stores a lasso identity dump and a lasso session dump in
- * the given session object.
- *
- * Parameters:
- *  am_cache_entry_t *session   The session object.
- *  const char *lasso_identity  The identity dump.
- *  const char *lasso_session   The session dump.
- *
- * Returns:
- *  OK on success or HTTP_INTERNAL_SERVER_ERROR if the lasso state information
- *  is to big to fit in our session.
- */
-int am_cache_set_lasso_state(am_cache_entry_t *session,
-                             const char *lasso_identity,
-                             const char *lasso_session,
-                             const char *lasso_saml_response)
-{
-    int status;
-
-    status = am_cache_entry_store_string(session,
-                                         &session->lasso_identity,
-                                         lasso_identity);
-    if (status != 0) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "Lasso identity is too big for storage. Size of lasso"
-                     " identity is %" APR_SIZE_T_FMT ".",
-                     (apr_size_t)strlen(lasso_identity));
-        return HTTP_INTERNAL_SERVER_ERROR;
+    if (data_len > NAMEID_ENTRY_SIZE) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "name_id data size (%u) exceeds maximum "
+                      "name_id data size (%u)",
+                      data_len, NAMEID_ENTRY_SIZE);
+        return APR_FROM_OS_ERROR(EMSGSIZE);
     }
 
-    status = am_cache_entry_store_string(session,
-                                         &session->lasso_session,
-                                         lasso_session);
-    if (status != 0) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "Lasso session is too big for storage. Size of lasso"
-                     " session is %" APR_SIZE_T_FMT ".",
-                     (apr_size_t)strlen(lasso_session));
-        return HTTP_INTERNAL_SERVER_ERROR;
+    rv = socache_provider->store(socache_instance, r->server,
+                                 (const unsigned char *)name_id_key,
+                                 name_id_key_len,
+                                 expiration,
+                                 (unsigned char *)session_id,
+                                 data_len,
+                                 r->pool);
+    if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to store name_id entry "
+                      "session_id=%s name_id=%s expiration=%s now=%s "
+                      "key=%s error=[%d]: %s",
+                      session_id,
+                      am_lasso_name_id_string(r, name_id),
+                      am_time_t_to_8601(r->pool, expiration),
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      name_id_key,
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return rv;
     }
 
-    status = am_cache_entry_store_string(session,
-                                         &session->lasso_saml_response,
-                                         lasso_saml_response);
-    if (status != 0) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
-                     "Lasso SAML response is too big for storage. Size of "
-                     "lasso SAML Response is %" APR_SIZE_T_FMT ".",
-                     (apr_size_t)strlen(lasso_saml_response));
-        return HTTP_INTERNAL_SERVER_ERROR;
+    return APR_SUCCESS;
+}
+
+static apr_status_t
+am_cache_store_session_id_entry(request_rec *r,
+                                const char *session_id,
+                                LassoSaml2NameID *name_id,
+                                apr_time_t expiration,
+                                const char *session_xml)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *session_key = session_key_name(r, session_id);
+    unsigned int session_key_len = strlen(session_key);
+    unsigned int data_len = strlen(session_xml);
+    apr_status_t rv = APR_SUCCESS;
+
+    /*
+     * retrieve will fail if it's not provided with a buffer big
+     * enough to receive the data. Worse is the fact the error from
+     * some socache providers when the return buffer is too small is
+     * APR_NOTFOUND which is not the real reason.
+     */
+
+    am_diag_printf(r, "%s: session_id=\"%s\" name_id=\"%s\" "
+                   "session_key=%s session_key_len=%u "
+                   "expiration=%s now=%s "
+                   "data_len=%u session_xml:\n%s\n", __func__,
+                   session_id, am_lasso_name_id_string(r, name_id),
+                   session_key, session_key_len, 
+                   am_time_t_to_8601(r->pool, expiration),
+                   am_time_t_to_8601(r->pool, apr_time_now()),
+                   data_len, session_xml);
+
+    if (data_len > mod_cfg->socache_session_state_entry_size) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "session data size (%u) exceeds maximum "
+                      "session data size (%u)",
+                      data_len, mod_cfg->socache_session_state_entry_size);
+        return APR_FROM_OS_ERROR(EMSGSIZE);
     }
 
-    return OK;
+    rv = socache_provider->store(socache_instance, r->server,
+                                 (const unsigned char *)session_key,
+                                 session_key_len,
+                                 expiration,
+                                 (unsigned char *)session_xml,
+                                 data_len,
+                                 r->pool);
+    if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to store session_id entry "
+                      "session_id=%s name_id=%s expiration=%s now=%s "
+                      "key=%s error=[%d]: %s",
+                      session_id,
+                      am_lasso_name_id_string(r, name_id),
+                      am_time_t_to_8601(r->pool, expiration),
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      session_key,
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return rv;
+    }
+
+    return APR_SUCCESS;
 }
 
-
-/* This function retrieves a lasso identity dump from the session object.
- *
- * Parameters:
- *  am_cache_entry_t *session  The session object.
- *
- * Returns:
- *  The identity dump, or NULL if we don't have a session dump.
- */
-const char *am_cache_get_lasso_identity(am_cache_entry_t *session)
+static apr_status_t
+am_cache_delete_name_id_entry(request_rec *r,
+                              LassoSaml2NameID *name_id,
+                              LassoSaml2NameID *issuer)
 {
-    return am_cache_entry_get_string(session, &session->lasso_identity);
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *name_id_key = name_id_key_name(r, name_id, issuer);
+    unsigned int name_id_key_len = strlen(name_id_key);
+    apr_status_t rv = APR_SUCCESS;
+
+    am_diag_printf(r, "%s: name_id=%s name_id_key=%s name_id_key_len=%u "
+                   "now=%s\n",
+                   __func__,
+                   am_lasso_name_id_string(r, name_id),
+                   name_id_key, name_id_key_len,
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if (name_id_key == NULL) {
+        return APR_EINVAL;
+    }
+
+    rv = socache_provider->remove(socache_instance, r->server,
+                                  (const unsigned char *)name_id_key,
+                                  name_id_key_len,
+                                  r->pool);
+    if (rv == APR_NOTFOUND) {
+        am_diag_printf(r, "%s: name_id not found, name_id=%s now=%s\n",
+                       __func__,
+                       am_lasso_name_id_string(r, name_id),
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        /* If the entry is already absent it's not an error */
+        return APR_SUCCESS;
+    } else if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to delete name_id entry "
+                      "name_id=%s now=%s error=[%d]: %s",
+                      am_lasso_name_id_string(r, name_id),
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+    }
+
+    return APR_SUCCESS;
 }
 
-
-/* This function retrieves a lasso session dump from the session object.
- *
- * Parameters:
- *  am_cache_entry_t *session  The session object.
- *
- * Returns:
- *  The session dump, or NULL if we don't have a session dump.
- */
-const char *am_cache_get_lasso_session(am_cache_entry_t *session)
+static apr_status_t
+am_cache_delete_session_id_entry(request_rec *r, const char *session_id)
 {
-    return am_cache_entry_get_string(session, &session->lasso_session);
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *session_key = session_key_name(r, session_id);
+    unsigned int session_key_len = strlen(session_key);
+    apr_status_t rv = APR_SUCCESS;
+
+    am_diag_printf(r, "%s: session_id=%s name_id_key=%s name_id_key_len=%u "
+                   "now=%s\n",
+                   __func__, session_id,
+                   session_key, session_key_len,
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    rv = socache_provider->remove(socache_instance, r->server,
+                                  (const unsigned char *)session_key,
+                                  session_key_len,
+                                  r->pool);
+    if (rv == APR_NOTFOUND) {
+        am_diag_printf(r, "%s: session_id not found, session_id=%s now=%s\n",
+                       __func__, session_id,
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        /* If the entry is already absent it's not an error */
+        return APR_SUCCESS;
+    } else if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to delete session_id entry "
+                      "session_id=%s now=%s error=[%d]: %s",
+                      session_id, am_time_t_to_8601(r->pool, apr_time_now()),
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+    }
+
+    return APR_SUCCESS;
 }
+
+apr_status_t
+am_cache_delete_session_entries(request_rec *r,
+                                const char *session_id,
+                                LassoSaml2NameID *name_id,
+                                LassoSaml2NameID *issuer)
+{
+    apr_status_t session_id_rv = APR_SUCCESS;
+    apr_status_t name_id_rv = APR_SUCCESS;
+    apr_status_t rv = APR_SUCCESS;
+
+    am_diag_printf(r, "%s: session_id=%s name_id=%s now=%s\n",
+                   __func__, session_id,
+                   am_lasso_name_id_string(r, name_id),
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if ((rv = am_cache_aquire_lock(r)) != APR_SUCCESS) {
+        return rv;
+    }
+
+    session_id_rv = am_cache_delete_session_id_entry(r, session_id);
+    name_id_rv = am_cache_delete_name_id_entry(r, name_id, issuer);
+
+    rv = session_id_rv != APR_SUCCESS ? session_id_rv : name_id_rv;
+
+    am_cache_release_lock(r);
+
+    return rv;
+}
+
+static am_session_state_t *
+am_cache_parse_session_xml(request_rec *r, const char *session_xml) {
+    xmlDocPtr session_doc = NULL;
+    am_session_state_t *session = NULL;
+
+    session_doc = am_get_xml_doc_from_string(r, session_xml);
+    if (session_doc == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to parse XML session state text "
+                      "into XML document: %s", session_xml);
+        return NULL;
+    }
+
+    session = am_session_state_from_xml(r, session_doc);
+    if (session == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed load session state from XML document");
+        return NULL;
+    }
+
+    return session;
+}
+
+am_session_state_t *
+am_cache_load_session_by_session_id(request_rec *r, const char *session_id)
+{
+    const char *session_xml = NULL;
+    am_session_state_t *session = NULL;
+
+    am_diag_printf(r, "%s: lookup session by session _id %s now=%s\n",
+                   __func__, session_id,
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if (session_id == NULL) {
+        return NULL;
+    }
+
+    if (am_cache_aquire_lock(r) != APR_SUCCESS) {
+        return NULL;
+    }
+
+    session_xml = am_cache_load_session_xml_from_session_id(r, session_id);
+    if (session_xml == NULL) {
+        am_diag_printf(r, "%s: session not found using session_id, "
+                       "session_id=%s now=%s\n",
+                       __func__, session_id,
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        am_cache_release_lock(r);
+        return NULL;
+    }
+
+    session = am_cache_parse_session_xml(r, session_xml);
+
+    am_cache_release_lock(r);
+
+    return session;
+}
+
+am_session_state_t *
+am_cache_load_session_by_name_id(request_rec *r,
+                                 LassoSaml2NameID *name_id,
+                                 LassoSaml2NameID *issuer)
+{
+    const char *session_id = NULL;
+    const char *session_xml = NULL;
+    am_session_state_t *session = NULL;
+
+    am_diag_printf(r, "%s: lookup session by name_id %s, now=%s\n",
+                   __func__,
+                   am_lasso_name_id_string(r, name_id),
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if (name_id == NULL) {
+        return NULL;
+    }
+
+    if (am_cache_aquire_lock(r) != APR_SUCCESS) {
+        return NULL;
+    }
+
+    session_id = am_cache_load_session_id_from_name_id(r, name_id, issuer);
+    if (session_id == NULL) {
+        am_diag_printf(r, "%s: session not found using name_id, "
+                       "name_id=%s now=%s\n",
+                       __func__,
+                       am_lasso_name_id_string(r, name_id),
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        am_cache_release_lock(r);
+        return NULL;
+    }
+
+    session_xml = am_cache_load_session_xml_from_session_id(r, session_id);
+    if (session_xml == NULL) {
+        am_diag_printf(r, "%s: session not found using session_id, "
+                       "session_id=%s now=%s\n",
+                       __func__, session_id,
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        am_cache_release_lock(r);
+        return NULL;
+    }
+
+    am_cache_release_lock(r);
+
+    session = am_cache_parse_session_xml(r, session_xml);
+
+    return session;
+}
+
+apr_status_t
+am_cache_store_session_entries(request_rec *r,
+                               const char *session_id,
+                               LassoSaml2NameID *name_id,
+                               LassoSaml2NameID *issuer,
+                               apr_time_t expiration,
+                               const char *session_xml)
+{
+    apr_status_t session_id_rv = APR_SUCCESS;
+    apr_status_t name_id_rv = APR_SUCCESS;
+    apr_status_t rv = APR_SUCCESS;
+
+    am_diag_printf(r, "%s: session_id=%s name_id=%s now=%s\n",
+                   __func__, session_id,
+                   am_lasso_name_id_string(r, name_id),
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if ((rv = am_cache_aquire_lock(r)) != APR_SUCCESS) {
+        return rv;
+    }
+
+    name_id_rv = am_cache_store_name_id_entry(r, session_id, name_id,
+                                              issuer, expiration);
+    session_id_rv = am_cache_store_session_id_entry(r, session_id, name_id,
+                                                    expiration, session_xml);
+
+    rv = session_id_rv != APR_SUCCESS ? session_id_rv : name_id_rv;
+
+    am_cache_release_lock(r);
+
+    return rv;
+}
+
+#ifdef ENABLE_DIAGNOSTICS
+
+static const char *
+diag_dir_key_name(request_rec *r, const char *diag_dir)
+{
+    const char *key = NULL;
+    
+    key = am_sha256_sum(r, (unsigned char *)diag_dir, strlen(diag_dir));
+    return apr_psprintf(r->pool, "%s:%s", DIAG_DIR_KEY_PREFIX, key);
+}
+
+apr_status_t
+am_cache_store_diag_dir(request_rec *r, const char *diag_dir, const char *data,
+                        apr_time_t expiration)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *diag_dir_key = diag_dir_key_name(r, diag_dir);
+    unsigned int diag_key_len = strlen(diag_dir_key);
+    unsigned int data_len = strlen(data);
+    apr_status_t rv = APR_SUCCESS;
+
+    am_diag_printf(r, "%s: diag_dir=\"%s\" "
+                   "diag_dir_key=%s diag_key_len=%u "
+                   "expiration=%s now=%s data_len=%u data=%s\n", __func__,
+                   diag_dir, diag_dir_key, diag_key_len,
+                   am_time_t_to_8601(r->pool, expiration),
+                   am_time_t_to_8601(r->pool, apr_time_now()),
+                   data_len, data);
+
+    if (data_len > DIAG_DIR_ENTRY_SIZE) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "diag_dir data size (%u) exceeds maximum "
+                      "diag_dir data size (%u)",
+                      data_len, DIAG_DIR_ENTRY_SIZE);
+        return APR_FROM_OS_ERROR(EMSGSIZE);
+    }
+
+    rv = socache_provider->store(socache_instance, r->server,
+                                 (const unsigned char *)diag_dir_key,
+                                 diag_key_len,
+                                 expiration,
+                                 (unsigned char *)data,
+                                 data_len,
+                                 r->pool);
+    if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to store diag_dir entry "
+                      "diag_dir=%s expiration=%s now=%s "
+                      "key=%s error=[%d]: %s",
+                      diag_dir,
+                      am_time_t_to_8601(r->pool, expiration),
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      diag_dir_key,
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return rv;
+    }
+
+    return APR_SUCCESS;
+}
+
+const char *
+am_cache_load_diag_dir(request_rec *r, const char *diag_dir)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(r->server);
+    ap_socache_provider_t *socache_provider = mod_cfg->socache_provider;
+    ap_socache_instance_t *socache_instance = mod_cfg->socache_instance;
+    const char *diag_dir_key = diag_dir_key_name(r, diag_dir);
+    unsigned int diag_dir_key_len = strlen(diag_dir_key);
+    apr_status_t rv = APR_SUCCESS;
+
+    unsigned int entry_buf_len = DIAG_DIR_ENTRY_SIZE;
+    char *entry_buf = NULL;
+
+    am_diag_printf(r, "%s: diag_dir=%s diag_dir_key=%s diag_dir_key_len=%u "
+                   "now=%s\n",
+                   __func__, diag_dir,
+                   diag_dir_key, diag_dir_key_len,
+                   am_time_t_to_8601(r->pool, apr_time_now()));
+
+    if (diag_dir == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "diag_dir was NULL");
+        return NULL;
+    }
+
+    entry_buf = apr_palloc(r->pool, entry_buf_len + 1);
+    if (entry_buf == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to allocate diag_dir buffer");
+        return NULL;
+    }
+
+    rv = socache_provider->retrieve(socache_instance, r->server,
+                                    (const unsigned char *)diag_dir_key,
+                                    diag_dir_key_len,
+                                    (unsigned char *)entry_buf, &entry_buf_len,
+                                    r->pool);
+
+    if (rv == APR_NOTFOUND) {
+        am_diag_printf(r, "%s: diag_dir not found using diag_dir=%s now=%s\n",
+                       __func__, diag_dir,
+                       am_time_t_to_8601(r->pool, apr_time_now()));
+        return NULL;
+    } else if (rv != APR_SUCCESS) {
+        char error_buf[512];
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to retrieve diag_dir=%s now=%s error=[%d]: %s",
+                      diag_dir,
+                      am_time_t_to_8601(r->pool, apr_time_now()),
+                      rv, apr_strerror(rv, error_buf, sizeof(error_buf)));
+        return NULL;
+    }
+
+    entry_buf[entry_buf_len] = '\0'; /* NULL-terminate */
+
+    am_diag_printf(r, "%s: successfully retrieved %u bytes\n",
+                   __func__, entry_buf_len);
+
+    return entry_buf;
+}
+
+
+#endif

@@ -27,6 +27,33 @@
 APLOG_USE_MODULE(auth_mellon);
 #endif
 
+/* This function is before after the configuration of the server is parsed
+ * (it's a pre-config hook).
+ *
+ * Parameters:
+ *  apr_pool_t *pool     The configuration pool. Valid as long as this
+ *                       configuration is valid.
+ *  apr_pool_t *log_pool A pool for memory which is cleared after each read
+ *                       through the config files.
+ *  apr_pool_t *tmp_pool A pool for memory which will be destroyed after
+ *                       all the post_config hooks are run.
+ *  server_rec *s        The current server record.
+ *
+ * Returns:
+ *  OK on successful initialization, or !OK on failure.
+ */
+static int am_pre_config_init(apr_pool_t *pool, apr_pool_t *log_pool,
+                              apr_pool_t *tmp_pool)
+{
+    apr_status_t rv;
+
+    rv = ap_mutex_register(pool, SOCACHE_ID, NULL, APR_LOCK_DEFAULT, 0);
+    if (rv != APR_SUCCESS)
+        return !OK;
+
+    return OK;
+}
+
 /* This function is called after the configuration of the server is parsed
  * (it's a post-config hook).
  *
@@ -34,26 +61,23 @@ APLOG_USE_MODULE(auth_mellon);
  * the shared memory.
  *
  * Parameters:
- *  apr_pool_t *conf     The configuration pool. Valid as long as this
+ *  apr_pool_t *pool     The configuration pool. Valid as long as this
  *                       configuration is valid.
- *  apr_pool_t *log      A pool for memory which is cleared after each read
+ *  apr_pool_t *log_pool A pool for memory which is cleared after each read
  *                       through the config files.
- *  apr_pool_t *tmp      A pool for memory which will be destroyed after
+ *  apr_pool_t *tmp_pool A pool for memory which will be destroyed after
  *                       all the post_config hooks are run.
  *  server_rec *s        The current server record.
  *
  * Returns:
  *  OK on successful initialization, or !OK on failure.
  */
-static int am_global_init(apr_pool_t *conf, apr_pool_t *log,
-                          apr_pool_t *tmp, server_rec *s)
+static int am_post_config_init(apr_pool_t *pool, apr_pool_t *log_pool,
+                               apr_pool_t *tmp_pool, server_rec *s)
 {
-    apr_size_t        mem_size;
-    am_mod_cfg_rec   *mod;
-    int rv;
     const char userdata_key[] = "auth_mellon_init";
-    char buffer[512];
     void *data;
+    apr_status_t apr_status;
 
     /* Apache tests loadable modules by loading them (as is the only way).
      * This has the effect that all modules are loaded and initialised twice,
@@ -73,71 +97,13 @@ static int am_global_init(apr_pool_t *conf, apr_pool_t *log,
         return OK;
     } 
 
-    mod = am_get_mod_cfg(s);
-
-    /* If the session store is initialized then we can't change it. */
-    if(mod->cache != NULL) {
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, s,
-                     "auth_mellon session store already initialized -"
-                     " reinitialization skipped.");
-        return OK;
-    }
-
-    /* Copy from the variables set by the configuration file into variables
-     * which will be set only once. We do this to avoid confusion if the user
-     * tries to change the parameters of the session store after it is
-     * initialized.
-     */
-    mod->init_cache_size = mod->cache_size;
-    mod->init_lock_file = apr_pstrdup(conf, mod->lock_file);
-    mod->init_entry_size = mod->entry_size;
-    if (mod->init_entry_size < AM_CACHE_MIN_ENTRY_SIZE) {
-        mod->init_entry_size = AM_CACHE_MIN_ENTRY_SIZE;
-    }
-
-    /* find out the memory size of the cache */
-    mem_size = mod->init_entry_size * mod->init_cache_size;
-
-
-    /* Create the shared memory, exit if it fails. */
-    rv = apr_shm_create(&(mod->cache), mem_size, NULL, conf);
-
-    if (rv != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rv, s,
-                     "shm_create: Error [%d] \"%s\"", rv,
-                     apr_strerror(rv, buffer, sizeof(buffer)));
+    /* Initialize the session cache. */
+    apr_status = am_socache_init(pool, tmp_pool, s);
+    if (apr_status != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s,
+                     "failed to initialize socache");
         return !OK;
     }
-
-    /* Initialize the session table. */
-    am_cache_init(mod);
-
-    /* Now create the mutex that we need for locking the shared memory, then
-     * test for success. we really need this, so we exit on failure. */
-    rv = apr_global_mutex_create(&(mod->lock),
-                                 mod->init_lock_file,
-                                 APR_LOCK_DEFAULT,
-                                 conf);
-
-    if (rv != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rv, s,
-                     "mutex_create: Error [%d] \"%s\"", rv,
-                     apr_strerror(rv, buffer, sizeof(buffer)));
-        return !OK;
-    }
-
-#ifdef AP_NEED_SET_MUTEX_PERMS
-    /* On some platforms the mutex is implemented as a file. To allow child
-     * processes running as a different user to open it, it is necessary to
-     * change the permissions on it. */
-    rv = ap_unixd_set_global_mutex_perms(mod->lock);
-    if (rv != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_CRIT, rv, s,
-                     "Failed to set permissions on session table lock;"
-                     " check User and Group directives");
-        return rv;
-    }
-#endif
 
     return OK;
 }
@@ -157,15 +123,19 @@ static int am_global_init(apr_pool_t *conf, apr_pool_t *log,
  */
 static void am_child_init(apr_pool_t *p, server_rec *s)
 {
-    am_mod_cfg_rec *m = am_get_mod_cfg(s);
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(s);
     apr_status_t rv;
+    const char *lockfile;
     CURLcode curl_res;
 
-    /* Reinitialize the mutex for the child process. */
-    rv = apr_global_mutex_child_init(&(m->lock), m->init_lock_file, p);
-    if (rv != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rv, s,
-                     "Child process could not connect to mutex");
+    if (mod_cfg->socache_provider->flags & AP_SOCACHE_FLAG_NOTMPSAFE) {
+        /* Reinitialize the mutex for the child process. */
+        lockfile = apr_global_mutex_lockfile(mod_cfg->socache_lock);
+        rv = apr_global_mutex_child_init(&mod_cfg->socache_lock, lockfile, p);
+        if (rv != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s,
+                         "Child process could not connect to mutex");
+        }
     }
 
     /* lasso_init() must be run before any other lasso-functions. */
@@ -209,7 +179,8 @@ static void register_hooks(apr_pool_t *p)
 {
     ap_hook_access_checker(am_auth_mellon_user, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_check_user_id(am_check_uid, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_post_config(am_global_init, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_pre_config(am_pre_config_init, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_post_config(am_post_config_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_child_init(am_child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_create_request(am_create_request, NULL, NULL, APR_HOOK_MIDDLE);
 

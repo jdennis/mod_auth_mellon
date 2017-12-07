@@ -106,6 +106,30 @@ static const int default_env_vars_count_in_n = -1;
 static const char * const default_redirect_domains[] = { "[self]", NULL };
 
 
+/*
+ * This is a variation of ap_set_deprecated which returns an error if
+ * a deprecated directive is used, that prevents the server from
+ * successfully starting. Instead if someone specifies a deprecated
+ * directive we want to allow the module to load and the server to
+ * start, but log a warning in the log file.
+ *
+ * If the warning should include specific deprecation advice then that
+ * string should be the help string in the directive declaration, NULL
+ * otherwise.
+ */
+
+static const char *
+am_set_deprecated(cmd_parms *cmd, void *struct_ptr, const char *arg)
+{
+    ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, cmd->server,
+                 "WARNING %s is deprecated, it has no effect and "
+                 "will be removed in a future release. %s",
+                 cmd->directive->directive,
+                 cmd->cmd->errmsg ? cmd->cmd->errmsg : "");
+    return NULL;
+}
+
+
 /* This function handles configuration directives which set a 
  * multivalued string slot in the module configuration (the destination
  * strucure is a hash).
@@ -550,6 +574,36 @@ static const char *am_set_module_diag_flags_slot(cmd_parms *cmd,
                  cmd->directive->directive);
     return NULL;
 #endif
+}
+
+static const char *am_set_module_socache_slot(cmd_parms *cmd,
+                                              void *struct_ptr,
+                                              const char *arg)
+{
+    am_mod_cfg_rec *mod_cfg = am_get_mod_cfg(cmd->server);
+    apr_status_t apr_status;
+    const char *errmsg = NULL;
+
+    /* Argument is of form 'name:args' or just 'name'. */
+    mod_cfg->socache_provider_args = ap_strchr_c(arg, ':');
+    if (mod_cfg->socache_provider_args) {
+        mod_cfg->socache_provider_name = apr_pstrmemdup(cmd->pool, arg,
+                                       mod_cfg->socache_provider_args - arg);
+        mod_cfg->socache_provider_args++;
+    } else {
+        mod_cfg->socache_provider_name = arg;
+    }
+
+    apr_status = am_get_socache_provider(cmd->pool,
+                                         mod_cfg->socache_provider_name,
+                                         &mod_cfg->socache_provider, &errmsg);
+
+    if (apr_status != APR_SUCCESS) {
+        return apr_psprintf(cmd->pool, "%s: %s",
+                     cmd->directive->directive, errmsg);
+    }
+
+    return NULL;
 }
 
 /* This function handles the MellonCookieSameSite configuration directive.
@@ -1204,31 +1258,26 @@ const command_rec auth_mellon_commands[] = {
 
     /* Global configuration directives. */
 
-    AP_INIT_TAKE1(
+    AP_INIT_RAW_ARGS(
         "MellonCacheSize",
-        am_set_module_config_int_slot,
-        (void *)APR_OFFSETOF(am_mod_cfg_rec, cache_size),
-        RSRC_CONF,
-        "The number of sessions we can keep track of at once. You must"
-        " restart the server before any changes to this directive will"
-        " take effect. The default value is 100."
+        am_set_deprecated,
+        NULL,
+        OR_ALL,
+        NULL
         ),
-    AP_INIT_TAKE1(
+    AP_INIT_RAW_ARGS(
         "MellonCacheEntrySize",
-        am_set_module_config_int_slot,
-        (void *)APR_OFFSETOF(am_mod_cfg_rec, entry_size),
-        RSRC_CONF,
-        "The maximum size for a single session entry. You must"
-        " restart the server before any changes to this directive will"
-        " take effect. The default value is 192KiB."
+        am_set_deprecated,
+        NULL,
+        OR_ALL,
+        NULL
         ),
-    AP_INIT_TAKE1(
+    AP_INIT_RAW_ARGS(
         "MellonLockFile",
-        am_set_module_config_file_slot,
-        (void *)APR_OFFSETOF(am_mod_cfg_rec, lock_file),
-        RSRC_CONF,
-        "The lock file for session synchronization."
-        " Default value is \"/var/run/mod_auth_mellon.lock\"."
+        am_set_deprecated,
+        NULL,
+        OR_ALL,
+        NULL
         ), 
     AP_INIT_TAKE1(
         "MellonPostDirectory",
@@ -1285,6 +1334,22 @@ const command_rec auth_mellon_commands[] = {
         RSRC_CONF,
         "Diagnostics flags. [on|off] "
         " Default value is \"off\"."
+        ),
+    AP_INIT_TAKE1(
+        "MellonSoCache",
+        am_set_module_socache_slot,
+        NULL,
+        RSRC_CONF,
+        "SoCache Provider "
+        "Argument is of form 'name:args' or just 'name'."
+        ),
+    AP_INIT_TAKE1(
+        "MellonSoCacheSessionStateSize",
+        am_set_module_config_int_slot,
+        (void *)APR_OFFSETOF(am_mod_cfg_rec, socache_session_state_entry_size),
+        RSRC_CONF,
+        "The maximum size for a single session state entry in the socache. "
+        "Default is "
         ),
 
 
@@ -2032,7 +2097,6 @@ void *auth_mellon_server_config(apr_pool_t *p, server_rec *s)
     srv->diag_cfg.filename = default_diag_filename;
     srv->diag_cfg.fd = NULL;
     srv->diag_cfg.flags = default_diag_flags;
-    srv->diag_cfg.dir_cfg_emitted = apr_table_make(p, 0);
 #endif
 
     /* we want to keeep our global configuration of shared memory and
@@ -2047,21 +2111,17 @@ void *auth_mellon_server_config(apr_pool_t *p, server_rec *s)
     /* the module has not been initiated at all */
     mod = apr_palloc(p, sizeof(*mod));
 
-    mod->cache_size = 100;  /* ought to be enough for everybody */
-    mod->lock_file  = "/var/run/mod_auth_mellon.lock";
     mod->post_dir   = NULL;
     mod->post_ttl   = post_ttl;
     mod->post_count = post_count;
     mod->post_size  = post_size;
 
-    mod->entry_size = AM_CACHE_DEFAULT_ENTRY_SIZE;
-
-    mod->init_cache_size = 0;
-    mod->init_lock_file = NULL;
-    mod->init_entry_size = 0;
-
-    mod->cache      = NULL;
-    mod->lock       = NULL;
+    mod->socache_lock = NULL;
+    mod->socache_provider_name = AP_SOCACHE_DEFAULT_PROVIDER;
+    mod->socache_provider_args = NULL;
+    mod->socache_provider = NULL;
+    mod->socache_instance = NULL;
+    mod->socache_session_state_entry_size = SESSION_STATE_ENTRY_SIZE;
 
     apr_pool_userdata_set(mod, key, apr_pool_cleanup_null, p);
 
@@ -2103,8 +2163,6 @@ void *auth_mellon_srv_merge(apr_pool_t *p, void *base, void *add)
                                default_diag_flags ?
                                add_cfg->diag_cfg.flags :
                                base_cfg->diag_cfg.flags);
-
-    new_cfg->diag_cfg.dir_cfg_emitted = apr_table_make(p, 0);
 
 #endif
 

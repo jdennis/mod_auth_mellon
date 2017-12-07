@@ -58,8 +58,14 @@
 #include "apr_xml.h"
 #include "apr_lib.h"
 #include "apr_fnmatch.h"
+#include "apr_random.h"
+
+#ifdef HAVE_apr_pescape_hex
+#include "apr_escape.h"
+#endif
 
 #include "ap_config.h"
+#include "ap_socache.h"
 #include "httpd.h"
 #include "http_config.h"
 #include "http_core.h"
@@ -67,19 +73,49 @@
 #include "http_protocol.h"
 #include "http_request.h"
 #include "mod_ssl.h"
-
+#include "util_mutex.h"
 
 /* Backwards-compatibility helpers. */
 #include "auth_mellon_compat.h"
 
 
-/* Size definitions for the session cache.
+#define ENV_ATTR_PREFIX "MELLON_"
+
+/* Initializing an apr_time_t to 0x7fffffffffffffffLL yields an
+ * iso 8601 time with 1 second precision of "294247-01-10T04:00:54Z"
+ * this is 22 characters, +1 for null terminator. */
+#define ISO_8601_BUF_SIZE 23
+#define ISO_8601_FMT  "%FT%TZ"
+
+/*
+ * Most ISO 8601 parsing routines can only handle dates with a 4 digit
+ * year. Even though apr_time_t can represent dates whose year > 9999
+ * we limit the maximum apr_time_t to 9999-12-31T23:59:59Z to
+ * accommodate the parsing routines, this date is sufficiently far
+ * into the future we can expect it to be greater than any date/time
+ * we see in actual data.
  */
-#define AM_CACHE_KEYSIZE 120
-#define AM_CACHE_ENVSIZE 2048
-#define AM_CACHE_USERSIZE 512
-#define AM_CACHE_DEFAULT_ENTRY_SIZE 196608
-#define AM_CACHE_MIN_ENTRY_SIZE 65536
+#define MAX_APR_TIME_T 253402300799000000L
+
+#define IS_NODE(node, node_name, node_ns)                       \
+    (node->type == XML_ELEMENT_NODE &&                          \
+     strcmp((const char *)node->name, node_name) == 0 &&        \
+     strcmp((const char *)node->ns->href, node_ns) == 0)
+
+#define FIRST_ATTR_VALUE(attr_values)           \
+    (attr_values && attr_values->nelts ?        \
+     APR_ARRAY_IDX(attr_values, 0, char *) :    \
+     NULL)
+
+
+#define SESSION_STATE_ENTRY_SIZE 65536
+#define SESSION_STATE_NODE_NAME "MellonSessionState"
+#define SESSION_STATE_VERSION "1.0"
+
+#define SESSION_STATE_NS_PREFIX "amss"
+#define SESSION_STATE_NS_HREF "mod_auth_mellon"
+
+#define XSI_NIL "nil"
 
 /* Internal error codes */
 #define AM_ERROR_INVALID_PAOS_HEADER 1
@@ -115,25 +151,21 @@ typedef enum {
 #endif
 
 typedef struct am_mod_cfg_rec {
-    int cache_size;
-    const char *lock_file;
     const char *post_dir;
     apr_time_t post_ttl;
     int post_count;
     apr_size_t post_size;
 
-    int entry_size;
-
     /* These variables can't be allowed to change after the session store
      * has been initialized. Therefore we copy them before initializing
      * the session store.
      */
-    int init_cache_size;
-    const char *init_lock_file;
-    apr_size_t init_entry_size;
-
-    apr_shm_t *cache;
-    apr_global_mutex_t *lock;
+    apr_global_mutex_t *socache_lock;
+    const char *socache_provider_name;
+    const char *socache_provider_args;
+    ap_socache_provider_t *socache_provider;
+    ap_socache_instance_t *socache_instance;
+    int socache_session_state_entry_size;
 } am_mod_cfg_rec;
 
 
@@ -142,7 +174,6 @@ typedef struct am_diag_cfg_rec {
     const char *filename;
     apr_file_t *fd;
     am_diag_flags_t flags;
-    apr_table_t *dir_cfg_emitted;
 } am_diag_cfg_rec;
 #endif
 
@@ -331,42 +362,20 @@ typedef struct am_req_cfg_rec {
 #endif
 } am_req_cfg_rec;
 
-typedef struct am_cache_storage_t {
-    apr_size_t ptr;
-} am_cache_storage_t;
-
-typedef struct am_cache_env_t {
-    am_cache_storage_t varname;
-    am_cache_storage_t value;
-} am_cache_env_t;
-
-typedef struct am_cache_entry_t {
-    char key[AM_CACHE_KEYSIZE];
-    am_cache_storage_t cookie_token;
-    apr_time_t access;
+typedef struct am_session_state_t {
+    apr_pool_t *pool;    
+    const char *session_id;
+    LassoSaml2NameID *lasso_name_id;
+    LassoSaml2NameID *issuer;
+    apr_hash_t *env_attrs;
     apr_time_t expires;
     int logged_in;
-    unsigned short size;
-    am_cache_storage_t user;
-
-    /* Variables used to store lasso state between login requests
-     *and logout requests.
-     */
-    am_cache_storage_t lasso_identity;
-    am_cache_storage_t lasso_session;
-    am_cache_storage_t lasso_saml_response;
-
-    am_cache_env_t env[AM_CACHE_ENVSIZE];
-
-    apr_size_t pool_size;
-    apr_size_t pool_used;
-    char pool[];
-} am_cache_entry_t;
-
-typedef enum { 
-    AM_CACHE_SESSION, 
-    AM_CACHE_NAMEID 
-} am_cache_key_t;
+    const char *user;
+    const char *cookie_token;
+    const char *lasso_identity_dump;
+    const char *lasso_session_dump;
+    const char *saml_response;
+} am_session_state_t;
 
 /* Type for configuring environment variable names */
 typedef struct am_envattr_conf_t {
@@ -438,44 +447,154 @@ void am_cookie_delete(request_rec *r);
 const char *am_cookie_token(request_rec *r);
 
 
-void am_cache_init(am_mod_cfg_rec *mod_cfg);
-am_cache_entry_t *am_cache_lock(request_rec *r, 
-                                am_cache_key_t type, const char *key);
-const char *am_cache_entry_get_string(am_cache_entry_t *e,
-                                      am_cache_storage_t *slot);
-am_cache_entry_t *am_cache_new(request_rec *r,
-                               const char *key,
-                               const char *cookie_token);
-void am_cache_unlock(request_rec *r, am_cache_entry_t *entry);
+apr_status_t
+am_get_socache_provider(apr_pool_t *pool, const char *name,
+                        ap_socache_provider_t **socache_provider_out,
+                        const char **errmsg_out);
 
-void am_cache_update_expires(request_rec *r, am_cache_entry_t *t, apr_time_t expires);
+apr_status_t
+am_socache_init(apr_pool_t *pool, apr_pool_t *tmp_pool, server_rec *s);
 
-void am_cache_env_populate(request_rec *r, am_cache_entry_t *session);
-int am_cache_env_append(am_cache_entry_t *session,
-                        const char *var, const char *val);
-const char *am_cache_env_fetch_first(am_cache_entry_t *t,
-                                     const char *var);
-void am_cache_delete(request_rec *r, am_cache_entry_t *session);
+/*--------------------------------- typedefs ---------------------------------*/
+/*--------------------------------- defines ----------------------------------*/
+/*---------------------------- auth_mellon_cache -----------------------------*/
 
-int am_cache_set_lasso_state(am_cache_entry_t *session,
-                             const char *lasso_identity,
-                             const char *lasso_session,
-                             const char *lasso_saml_response);
-const char *am_cache_get_lasso_identity(am_cache_entry_t *session);
-const char *am_cache_get_lasso_session(am_cache_entry_t *session);
+apr_status_t
+am_cache_delete_session_entries(request_rec *r,
+                                const char *session_id,
+                                LassoSaml2NameID *name_id,
+                                LassoSaml2NameID *issuer);
+
+apr_status_t
+am_cache_store_session_entries(request_rec *r,
+                               const char *session_id,
+                               LassoSaml2NameID *name_id,
+                               LassoSaml2NameID *issuer,
+                               apr_time_t expiration,
+                               const char *session_xml);
 
 
-am_cache_entry_t *am_get_request_session(request_rec *r);
-am_cache_entry_t *am_get_request_session_by_nameid(request_rec *r, 
-                                                   char *nameid);
-am_cache_entry_t *am_new_request_session(request_rec *r);
-void am_release_request_session(request_rec *r, am_cache_entry_t *session);
-void am_delete_request_session(request_rec *r, am_cache_entry_t *session);
+am_session_state_t *
+am_cache_load_session_by_session_id(request_rec *r, const char *session_id);
+
+am_session_state_t *
+am_cache_load_session_by_name_id(request_rec *r,
+                                 LassoSaml2NameID *name_id,
+                                 LassoSaml2NameID *issuer);
+
+#ifdef ENABLE_DIAGNOSTICS
+
+apr_status_t
+am_cache_store_diag_dir(request_rec *r, const char *diag_dir, const char *data,
+                        apr_time_t expiration);
+
+const char *
+am_cache_load_diag_dir(request_rec *r, const char *diag_dir);
+
+#endif
+/*---------------------------- auth_mellon_config ----------------------------*/
+/*---------------------------- auth_mellon_cookie ----------------------------*/
+/*-------------------------- auth_mellon_diagnostics -------------------------*/
+/*--------------------------- auth_mellon_handler ----------------------------*/
+/*-------------------------- auth_mellon_httpclient --------------------------*/
+/*---------------------------- auth_mellon_session ---------------------------*/
+
+apr_status_t
+am_session_store(request_rec *r, am_session_state_t *session);
+
+void am_session_update_expires(request_rec *r, am_session_state_t *session,
+                               apr_time_t expires);
+
+void
+am_session_set_expriation_from_assertion(request_rec *r,
+                                         am_session_state_t *session,
+                                         LassoSaml2Assertion *assertion);
+
+int
+am_session_add_attributes_from_assertion(am_session_state_t *session,
+                                         request_rec *r,
+                                         LassoSaml2NameID *name_id,
+                                         LassoSaml2NameID *issuer,
+                                         LassoSaml2Assertion *assertion);
+
+/*----------------------------- auth_mellon_util -----------------------------*/
+
+apr_time_t am_parse_timestamp(request_rec *r, const char *timestamp);
+
+am_session_state_t *
+am_session_state_new(request_rec *r);
+
+am_session_state_t *
+am_session_state_from_xml(request_rec *r, xmlDocPtr doc);
+
+apr_array_header_t *
+am_session_set_env_attr_name(request_rec *r, am_session_state_t *ss,
+                                 const char *name);
+
+bool
+am_session_env_attr_values_has_value(apr_array_header_t *values,
+                                     const char *value);
+
+bool
+am_session_env_attr_has_value(request_rec *r, am_session_state_t *ss,
+                              const char *name, const char *value);
+
+apr_array_header_t *
+am_session_set_env_attr_value(request_rec *r, am_session_state_t *ss,
+                              const char *name, const char *value);
+
+apr_array_header_t *
+am_session_get_env_attr_values(request_rec *r, am_session_state_t *ss,
+                               const char *name);
+
+const char *
+am_session_get_first_env_attr_value(request_rec *r, am_session_state_t *ss,
+                                    const char *name);
+
+void am_session_export_env(request_rec *r, am_session_state_t *ss);
+
+char *
+am_str_join(apr_pool_t *pool, apr_array_header_t *strings,
+            const char *separator);
+
+xmlNodePtr
+am_xml_get_first_child(xmlNodePtr node, const char *name, const char *ns_href);
+
+char *
+am_time_t_to_8601(apr_pool_t *pool, apr_time_t t);
+
+const char *
+am_mapped_env_attr_name(request_rec *r, const char *attr_name,
+                        const char **prefixed_out);
+
+xmlDocPtr am_get_xml_doc_from_string(request_rec *r, const char *xml_text);
+
+char *am_xml_doc_to_string(request_rec *r, xmlDocPtr doc, int format);
+
+char* am_xmlnode_to_string(request_rec *r, xmlNode *node, int format);
+
+const char *
+am_lasso_node_to_string(request_rec *r, LassoNode *node);
+
+apr_status_t
+am_normalize_lasso_name_id(request_rec *r, LassoSaml2NameID *name_id,
+                           const char *default_name_qualifier);
+
+const char *
+am_lasso_name_id_string(request_rec *r, LassoSaml2NameID *name_id);
+
+am_session_state_t *am_get_request_session(request_rec *r);
+am_session_state_t *am_session_get_session_by_name_id(request_rec *r,
+                                                      LassoSaml2NameID *name_id,
+                                                      LassoSaml2NameID *issuer);
+am_session_state_t *am_new_request_session(request_rec *r);
+void am_release_request_session(request_rec *r, am_session_state_t **session_var);
+void am_session_delete(request_rec *r, am_session_state_t *session);
 
 
 char *am_reconstruct_url(request_rec *r);
 int am_validate_redirect_url(request_rec *r, const char *url);
-int am_check_permissions(request_rec *r, am_cache_entry_t *session);
+int am_check_permissions(request_rec *r, am_session_state_t *session);
 void am_set_cache_control_headers(request_rec *r);
 int am_read_post_data(request_rec *r, char **data, apr_size_t *length);
 char *am_extract_query_parameter(apr_pool_t *pool,
@@ -523,6 +642,16 @@ bool am_is_paos_request(request_rec *r, int *error_code);
 char *
 am_saml_response_status_str(request_rec *r, LassoNode *node);
 
+const char *
+am_sha256_sum(request_rec *r,
+              const unsigned char *data, apr_size_t data_len);
+
+LassoSamlp2RequestAbstract *
+am_get_request_abstract(request_rec *r, LassoProfile *profile);
+
+LassoSamlp2StatusResponse *
+am_get_status_response(request_rec *r, LassoProfile *profile);
+
 int am_auth_mellon_user(request_rec *r);
 int am_check_uid(request_rec *r);
 int am_handler(request_rec *r);
@@ -541,6 +670,9 @@ int am_httpclient_post_str(request_rec *r, const char *uri,
                            void **buffer, apr_size_t *size);
 
 
+/* socache */
+#define SOCACHE_ID "mellon-socache"
+
 extern module AP_MODULE_DECLARE_DATA auth_mellon_module;
 
 #ifdef ENABLE_DIAGNOSTICS
@@ -550,17 +682,9 @@ extern module AP_MODULE_DECLARE_DATA auth_mellon_module;
 #error "Diagnostics requires Apache version 2.4 or newer."
 #endif
 
-/* Initializing an apr_time_t to 0x7fffffffffffffffLL yields an
- * iso 8601 time with 1 second precision of "294247-01-10T04:00:54Z"
- * this is 22 characters, +1 for null terminator. */
-#define ISO_8601_BUF_SIZE 23
-
 typedef struct {
     bool req_headers_written;
 } am_diag_request_data;
-
-const char *
-am_diag_cache_key_type_str(am_cache_key_t key_type);
 
 const char *
 am_diag_cond_str(request_rec *r, const am_cond_t *cond);
@@ -572,9 +696,8 @@ const char *
 am_diag_lasso_http_method_str(LassoHttpMethod http_method);
 
 void
-am_diag_log_cache_entry(request_rec *r, int level, am_cache_entry_t *entry,
-                        const char *fmt, ...)
-    __attribute__((format(printf,4,5)));
+am_diag_log_session_state(request_rec *r, int level, am_session_state_t *ss,
+                          const char *fmt, ...);
 
 void
 am_diag_log_file_data(request_rec *r, int level, am_file_data_t *file_data,
@@ -608,9 +731,6 @@ am_diag_rerror(const char *file, int line, int module_index,
                int level, apr_status_t status,
                request_rec *r, const char *fmt, ...);
 
-char *
-am_diag_time_t_to_8601(request_rec *r, apr_time_t t);
-
 /* Define AM_LOG_RERROR log to both the Apache log and diagnostics log */
 #define AM_LOG_RERROR(...) AM_LOG_RERROR__(__VA_ARGS__)
 /* need additional step to expand macros */
@@ -622,7 +742,7 @@ am_diag_time_t_to_8601(request_rec *r, apr_time_t t);
 
 #else  /* ENABLE_DIAGNOSTICS */
 
-#define am_diag_log_cache_entry(...) do {} while(0)
+#define am_diag_log_session_state(...) do {} while(0)
 #define am_diag_log_file_data(...) do {} while(0)
 #define am_diag_log_lasso_node(...) do {} while(0)
 #define am_diag_log_saml_status_response(...) do {} while(0)

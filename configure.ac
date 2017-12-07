@@ -70,6 +70,9 @@ AC_CHECK_LIB(lasso, lasso_profile_set_signature_verify_hint,
 AC_CHECK_LIB(lasso, lasso_ecp_request_new,
              [AC_DEFINE([HAVE_ECP],[],
              [lasso library supports ECP profile])])
+AC_SEARCH_LIBS(apr_pescape_hex, [apr apr-1],
+             [AC_DEFINE([HAVE_apr_pescape_hex],[],
+             [APR library exports apr_pescape_hex])])
 LIBS=$saved_LIBS;
 AC_SUBST(LASSO_CFLAGS)
 AC_SUBST(LASSO_LIBS)

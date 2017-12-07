@@ -430,6 +430,29 @@ static int am_start_disco(request_rec *r, const char *return_to)
 }
 
 
+static LassoSaml2NameID *
+am_get_lasso_name_id(request_rec *r, LassoProfile *profile,
+                     const char *default_name_qualifier)
+{
+    LassoSaml2NameID *name_id = NULL;
+
+    name_id = LASSO_SAML2_NAME_ID(profile->nameIdentifier);
+    if (name_id == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      " No NameID found in profile");
+        return NULL;
+    }
+
+    if (am_normalize_lasso_name_id(r, name_id,
+                                   default_name_qualifier) != APR_SUCCESS) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "failed to normalize name_id");
+        return NULL;
+    }
+
+    return name_id;
+}
+
 /* This function returns the first configured IdP
  *
  * Parameters:
@@ -525,76 +548,71 @@ static const char *am_get_idp(request_rec *r)
  * belonging to the current request.
  *
  * Parameters:
- *  request_rec *r             The current request.
- *  am_cache_entry_t *session  The session we are creating.
- *  LassoProfile *profile      The profile object.
- *  char *saml_response        The full SAML 2.0 response message.
+ *  request_rec *r              The current request.
+ *  am_session_state_t *session The session we are creating.
+ *  LassoProfile *profile       The profile object.
+ *  char *saml_response         The full SAML 2.0 response message.
  *
  * Returns:
  *  OK on success or HTTP_INTERNAL_SERVER_ERROR on failure.
  */
-static int am_save_lasso_profile_state(request_rec *r,
-                                       am_cache_entry_t *session,
-                                       LassoProfile *profile,
-                                       char *saml_response)
+static int
+am_session_save_lasso_state(request_rec *r,
+                            am_session_state_t *session,
+                            LassoProfile *profile,
+                            char *saml_response)
 {
     LassoIdentity *lasso_identity;
     LassoSession *lasso_session;
-    gchar *identity_dump;
-    gchar *session_dump;
-    int ret;
+    int rc = OK;
+
+    session->saml_response = apr_pstrdup(r->pool, saml_response);
 
     lasso_identity = lasso_profile_get_identity(profile);
-    if(lasso_identity == NULL) {
+    if (lasso_identity != NULL) {
+        gchar *identity_dump = NULL;
+
+        identity_dump = lasso_identity_dump(lasso_identity);
+        if (identity_dump != NULL) {
+            session->lasso_identity_dump = apr_pstrdup(r->pool, identity_dump);
+            g_free(identity_dump);
+        } else {
+            rc = HTTP_INTERNAL_SERVER_ERROR;
+            session->lasso_identity_dump = NULL;
+            AM_LOG_RERROR(APLOG_MARK, APLOG_DEBUG, rc, r,
+                          "Unable to acquire dump from LassoIdentity.");
+        }
+    } else {
+        /* Not an error if there is no LassoIdentity, just log the fact */
+        session->lasso_identity_dump = NULL;
         AM_LOG_RERROR(APLOG_MARK, APLOG_DEBUG, 0, r,
                       "The current LassoProfile object doesn't contain a"
                       " LassoIdentity object.");
-        identity_dump = NULL;
-    } else {
-        identity_dump = lasso_identity_dump(lasso_identity);
-        if(identity_dump == NULL) {
-            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                          "Could not create a identity dump from the"
-                          " LassoIdentity object.");
-            return HTTP_INTERNAL_SERVER_ERROR;
-        }
     }
 
     lasso_session = lasso_profile_get_session(profile);
-    if(lasso_session == NULL) {
+    if (lasso_session != NULL) {
+        gchar *session_dump = NULL;
+
+        session_dump = lasso_session_dump(lasso_session);
+        if (session_dump != NULL) {
+            session->lasso_session_dump = apr_pstrdup(r->pool, session_dump);
+            g_free(session_dump);
+        } else {
+            rc = HTTP_INTERNAL_SERVER_ERROR;
+            session->lasso_session_dump = NULL;
+            AM_LOG_RERROR(APLOG_MARK, APLOG_DEBUG, rc, r,
+                          "Unable to acquire dump from LassoSession.");
+        }
+    } else {
+        /* Not an error if there is no LassoSession, just log the fact */
+        session->lasso_session_dump = NULL;
         AM_LOG_RERROR(APLOG_MARK, APLOG_DEBUG, 0, r,
                       "The current LassoProfile object doesn't contain a"
                       " LassoSession object.");
-        session_dump = NULL;
-    } else {
-        session_dump = lasso_session_dump(lasso_session);
-        if(session_dump == NULL) {
-            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                          "Could not create a session dump from the"
-                          " LassoSession object.");
-            if(identity_dump != NULL) {
-                g_free(identity_dump);
-            }
-            return HTTP_INTERNAL_SERVER_ERROR;
-        }
     }
 
-
-    /* Save the profile state. */
-    ret = am_cache_set_lasso_state(session,
-                                   identity_dump,
-                                   session_dump,
-                                   saml_response);
-
-    if(identity_dump != NULL) {
-        g_free(identity_dump);
-    }
-
-    if(session_dump != NULL) {
-        g_free(session_dump);
-    }
-
-    return ret;
+    return rc;
 }
 
 
@@ -641,53 +659,50 @@ static int am_return_logout_response(request_rec *r,
  * request and restored to the given LassoProfile object.
  *
  * Parameters:
- *  request_rec *r         The current request.
- *  LassoProfile *profile  The profile object.
- *  am_cache_entry_t *am_session The session structure.
+ *  request_rec *r              The current request.
+ *  LassoProfile *profile       The profile object.
+ *  am_session_state_t *session The session structure.
  *
  * Returns:
  *  OK on success or HTTP_INTERNAL_SERVER_ERROR on failure.
  */
-static void am_restore_lasso_profile_state(request_rec *r, 
-                                           LassoProfile *profile,
-                                           am_cache_entry_t *am_session)
+static int
+am_restore_lasso_profile_state(request_rec *r, LassoProfile *profile,
+                               am_session_state_t *session)
 {
-    const char *identity_dump;
-    const char *session_dump;
-    int rc;
-
-
-    if(am_session == NULL) {
+    if (session == NULL) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "Could not get auth_mellon session while attempting"
-                      " to restore the lasso profile state.");
-        return;
+                      "No session while attempting "
+                      "to restore the lasso profile state.");
+        return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    identity_dump = am_cache_get_lasso_identity(am_session);
-    if(identity_dump != NULL) {
-        rc = lasso_profile_set_identity_from_dump(profile, identity_dump);
+    if (session->lasso_identity_dump != NULL) {
+        int rc;
+        rc = lasso_profile_set_identity_from_dump(profile, session->lasso_identity_dump);
         if(rc != 0) {
             AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                           "Could not restore identity from dump."
                           " Lasso error: [%i] %s", rc, lasso_strerror(rc));
-            am_release_request_session(r, am_session);
+            return HTTP_INTERNAL_SERVER_ERROR;
         }
-    }
+    }    
 
-    session_dump = am_cache_get_lasso_session(am_session);
-    if(session_dump != NULL) {
-        rc = lasso_profile_set_session_from_dump(profile, session_dump);
+    if (session->lasso_session_dump != NULL) {
+        int rc;
+        rc = lasso_profile_set_session_from_dump(profile, session->lasso_session_dump);
         if(rc != 0) {
             AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                           "Could not restore session from dump."
                           " Lasso error: [%i] %s", rc, lasso_strerror(rc));
-            am_release_request_session(r, am_session);
+            return HTTP_INTERNAL_SERVER_ERROR;
         }
-    }
-    am_diag_log_cache_entry(r, 0, am_session, "%s: Session Cache Entry", __func__);
+    }    
 
+    am_diag_log_session_state(r, 0, session, "%s: Session State", __func__);
     am_diag_log_profile(r, 0, profile,  "%s: Restored Profile", __func__);
+
+    return OK;
 }
 
 /* This function handles an IdP initiated logout request.
@@ -704,13 +719,18 @@ static int am_handle_logout_request(request_rec *r,
                                     LassoLogout *logout, char *msg)
 {
     gint res = 0, rc = HTTP_OK;
-    am_cache_entry_t *session = NULL;
+    am_session_state_t *session = NULL;
     am_dir_cfg_rec *cfg = am_get_dir_cfg(r);
+    LassoSaml2NameID *name_id = NULL;
+    const char *idp_entity_id = NULL;
 
     am_diag_printf(r, "enter function %s\n", __func__);
 
     /* Process the logout message. Ignore missing signature. */
     res = lasso_logout_process_request_msg(logout, msg);
+    am_diag_log_lasso_node(r, 0, LASSO_PROFILE(logout)->request,
+                           "Receive SAML Logout Request Message (%s): msg=%s",
+                           __func__, msg);
 #ifdef HAVE_lasso_profile_set_signature_verify_hint
     if(res != 0 && res != LASSO_DS_ERROR_SIGNATURE_NOT_FOUND &&
        logout->parent.remote_providerID != NULL) {
@@ -732,29 +752,30 @@ static int am_handle_logout_request(request_rec *r,
         goto exit;
     }
 
+    idp_entity_id = LASSO_PROFILE(logout)->remote_providerID;
+
     /* Search session using NameID */
-    if (! LASSO_IS_SAML2_NAME_ID(logout->parent.nameIdentifier)) {
-        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "Error processing logout request message."
-                      " No NameID found");
+    name_id = am_get_lasso_name_id(r, LASSO_PROFILE(logout), idp_entity_id);
+    if (name_id == NULL) {
         rc = HTTP_BAD_REQUEST;
         goto exit;
     }
 
-    am_diag_printf(r, "%s name id %s\n", __func__,
-                   ((LassoSaml2NameID*)logout->parent.nameIdentifier)->content);
+    am_diag_printf(r, "%s name_id=%s idp_entity_id=%s\n",
+                   __func__,
+                   am_lasso_name_id_string(r, name_id), idp_entity_id);
 
-    session = am_get_request_session_by_nameid(r,
-                    ((LassoSaml2NameID*)logout->parent.nameIdentifier)->content);
+    session = am_session_get_session_by_name_id(r, name_id,
+                                                LASSO_SAMLP2_REQUEST_ABSTRACT(LASSO_PROFILE(logout))->Issuer);
     if (session == NULL) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                       "Error processing logout request message."
-                      " No session found for NameID %s",
-                      ((LassoSaml2NameID*)logout->parent.nameIdentifier)->content);
+                      " No session found for NameID %s from IdP %s",
+                      am_lasso_name_id_string(r, name_id), idp_entity_id);
 
     }
 
-    am_diag_log_cache_entry(r, 0, session, "%s", __func__);
+    am_diag_log_session_state(r, 0, session, "%s", __func__);
 
     if (session == NULL) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
@@ -782,7 +803,7 @@ static int am_handle_logout_request(request_rec *r,
 
     if (session != NULL && res != LASSO_PROFILE_ERROR_SESSION_NOT_FOUND) {
         /* We found a matching session -- delete it. */
-        am_delete_request_session(r, session);
+        am_session_delete(r, session);
         session = NULL;
     }
 
@@ -800,7 +821,7 @@ static int am_handle_logout_request(request_rec *r,
 
 exit:
     if (session != NULL) {
-        am_release_request_session(r, session);
+        am_release_request_session(r, &session);
     }
 
     lasso_logout_destroy(logout);
@@ -823,13 +844,13 @@ static int am_handle_logout_response(request_rec *r, LassoLogout *logout)
 {
     gint res;
     int rc;
-    am_cache_entry_t *session;
+    am_session_state_t *session;
     char *return_to;
     am_dir_cfg_rec *cfg = am_get_dir_cfg(r);
 
     res = lasso_logout_process_response_msg(logout, r->args);
     am_diag_log_lasso_node(r, 0, LASSO_PROFILE(logout)->response,
-                           "SAML Response (%s):", __func__);
+                           "Receive SAML Logout Response (%s):", __func__);
 #ifdef HAVE_lasso_profile_set_signature_verify_hint
     if(res != 0 && res != LASSO_DS_ERROR_SIGNATURE_NOT_FOUND &&
        logout->parent.remote_providerID != NULL) {
@@ -859,10 +880,10 @@ static int am_handle_logout_response(request_rec *r, LassoLogout *logout)
     /* Delete the session. */
     session = am_get_request_session(r);
 
-    am_diag_log_cache_entry(r, 0, session, "%s\n", __func__);
+    am_diag_log_session_state(r, 0, session, "%s\n", __func__);
 
     if(session != NULL) {
-        am_delete_request_session(r, session);
+        am_session_delete(r, session);
     }
 
     return_to = am_extract_query_parameter(r->pool, r->args, "RelayState");
@@ -915,7 +936,7 @@ static int am_init_logout_request(request_rec *r, LassoLogout *logout)
 {
     char *return_to;
     int rc;
-    am_cache_entry_t *mellon_session;
+    am_session_state_t *mellon_session;
     gint res;
     char *redirect_to;
     LassoProfile *profile;
@@ -946,7 +967,7 @@ static int am_init_logout_request(request_rec *r, LassoLogout *logout)
     if(mellon_session != NULL) {
         am_restore_lasso_profile_state(r, &logout->parent, mellon_session);
         mellon_session->logged_in = 0;
-        am_release_request_session(r, mellon_session);
+        am_release_request_session(r, &mellon_session);
     }
 
     /* Create the logout request message. */
@@ -1057,6 +1078,13 @@ static int am_init_logout_request(request_rec *r, LassoLogout *logout)
 
     apr_table_setn(r->headers_out, "Location", redirect_to);
 
+    am_diag_log_lasso_node(r, 0, LASSO_PROFILE(logout)->request,
+                           "Send SAML Logout Request (%s): "
+                           "initial_http_method=%s URL=%s",
+                           __func__,
+                           am_diag_lasso_http_method_str(logout->initial_http_request_method),
+                           LASSO_PROFILE(logout)->msg_url);
+
     lasso_logout_destroy(logout);
 
     /* Redirect (without including POST data if this was a POST request. */
@@ -1137,143 +1165,6 @@ static int am_handle_logout(request_rec *r)
                       r->args);
         return HTTP_BAD_REQUEST;
     }
-}
-
-
-/* This function parses a timestamp for a SAML 2.0 condition.
- *
- * Parameters:
- *  request_rec *r          The current request. Used for logging of errors.
- *  const char *timestamp   The timestamp we should parse. Must be on
- *                          the following format: "YYYY-MM-DDThh:mm:ssZ"
- *
- * Returns:
- *  An apr_time_t value with the timestamp, or 0 on error.
- */
-static apr_time_t am_parse_timestamp(request_rec *r, const char *timestamp)
-{
-    size_t len;
-    int i;
-    char c;
-    const char *expected;
-    apr_time_exp_t time_exp;
-    apr_time_t res;
-    apr_status_t rc;
-
-    len = strlen(timestamp);
-
-    /* Verify length of timestamp. */
-    if(len < 20){
-        AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
-                      "Invalid length of timestamp: \"%s\".", timestamp);
-    }
-
-    /* Verify components of timestamp. */
-    for(i = 0; i < len - 1; i++) {
-        c = timestamp[i];
-
-        expected = NULL;
-
-        switch(i) {
-
-        case 4:
-        case 7:
-            /* Matches "    -  -            " */
-            if(c != '-') {
-                expected = "'-'";
-            }
-            break;
-
-        case 10:
-            /* Matches "          T         " */
-            if(c != 'T') {
-                expected = "'T'";
-            }
-            break;
-
-        case 13:
-        case 16:
-            /* Matches "             :  :   " */
-            if(c != ':') {
-                expected = "':'";
-            }
-            break;
-
-        case 19:
-            /* Matches "                   ." */
-            if (c != '.') {
-                expected = "'.'";
-            }
-            break;
-
-        default:
-            /* Matches "YYYY MM DD hh mm ss uuuuuu" */
-            if(c < '0' || c > '9') {
-                expected = "a digit";
-            }
-            break;
-        }
-
-        if(expected != NULL) {
-            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                          "Invalid character in timestamp at position %i."
-                          " Expected %s, got '%c'. Full timestamp: \"%s\"",
-                          i, expected, c, timestamp);
-            return 0;
-        }
-    }
-
-    if (timestamp[len - 1] != 'Z') {
-        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "Timestamp wasn't in UTC (did not end with 'Z')."
-                      " Full timestamp: \"%s\"",
-                      timestamp);
-        return 0;
-    }
-
-
-    time_exp.tm_usec = 0;
-    if (len > 20) {
-        /* Subsecond precision. */
-        if (len > 27) {
-            /* Timestamp has more than microsecond precision. Just clip it to
-             * microseconds.
-             */
-            len = 27;
-        }
-        len -= 1; /* Drop the 'Z' off the end. */
-        for (i = 20; i < len; i++) {
-            time_exp.tm_usec = time_exp.tm_usec * 10 + timestamp[i] - '0';
-        }
-        for (i = len; i < 26; i++) {
-            time_exp.tm_usec *= 10;
-        }
-    }
-
-    time_exp.tm_sec = (timestamp[17] - '0') * 10 + (timestamp[18] - '0');
-    time_exp.tm_min = (timestamp[14] - '0') * 10 + (timestamp[15] - '0');
-    time_exp.tm_hour = (timestamp[11] - '0') * 10 + (timestamp[12] - '0');
-    time_exp.tm_mday = (timestamp[8] - '0') * 10 + (timestamp[9] - '0');
-    time_exp.tm_mon = (timestamp[5] - '0') * 10 + (timestamp[6] - '0') - 1;
-    time_exp.tm_year = (timestamp[0] - '0') * 1000 +
-        (timestamp[1] - '0') * 100 + (timestamp[2] - '0') * 10 +
-        (timestamp[3] - '0') - 1900;
-
-    time_exp.tm_wday = 0; /* Unknown. */
-    time_exp.tm_yday = 0; /* Unknown. */
-
-    time_exp.tm_isdst = 0; /* UTC, no daylight savings time. */
-    time_exp.tm_gmtoff = 0; /* UTC, no offset from UTC. */
-
-    rc = apr_time_exp_gmt_get(&res, &time_exp);
-    if(rc != APR_SUCCESS) {
-        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, rc, r,
-                      "Error converting timestamp \"%s\".",
-                      timestamp);
-        return 0;
-    }
-
-    return res;
 }
 
 
@@ -1479,209 +1370,6 @@ static int am_validate_conditions(request_rec *r,
 
 
 
-/* This function sets the session expire timestamp based on NotOnOrAfter
- * attribute of a condition element.
- *
- * Parameters:
- *  request_rec *r                   The current request. Used to log
- *                                   errors.
- *  am_cache_entry_t *session        The current session.
- *  LassoSaml2Assertion *assertion   The assertion which we will extract
- *                                   the conditions from.
- *
- * Returns:
- *  Nothing.
- */
-static void am_handle_session_expire(request_rec *r, am_cache_entry_t *session,
-                                LassoSaml2Assertion *assertion)
-{
-    GList *authn_itr;
-    LassoSaml2AuthnStatement *authn;
-    const char *not_on_or_after;
-    apr_time_t t;
-
-    for(authn_itr = g_list_first(assertion->AuthnStatement); authn_itr != NULL;
-        authn_itr = g_list_next(authn_itr)) {
-
-        authn = authn_itr->data;
-        if (!LASSO_IS_SAML2_AUTHN_STATEMENT(authn)) {
-            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                          "Wrong type of AuthnStatement node.");
-            continue;
-        }
-
-        /* Find timestamp. */
-        not_on_or_after = authn->SessionNotOnOrAfter;
-        if(not_on_or_after == NULL) {
-            am_diag_printf(r, "%s failed to find"
-                           " Assertion.AuthnStatement.SessionNotOnOrAfter\n",
-                           __func__);
-            continue;
-        }
-
-
-        /* Parse timestamp. */
-        t = am_parse_timestamp(r, not_on_or_after);
-        if(t == 0) {
-            continue;
-        }
-
-        am_diag_printf(r, "%s Assertion.AuthnStatement.SessionNotOnOrAfter:"
-                       " %s\n",
-                       __func__, am_diag_time_t_to_8601(r, t));
-
-        /* Updates the expires timestamp if this one is earlier than the
-         * previous timestamp.
-         */
-        am_cache_update_expires(r, session, t);
-    }
-}
-
-/* Add all the attributes from an assertion to the session data for the
- * current user.
- *
- * Parameters:
- *  am_cache_entry_t *s             The current session.
- *  request_rec *r                  The current request.
- *  const char *name_id             The name identifier we received from
- *                                  the IdP.
- *  LassoSaml2Assertion *assertion  The assertion.
- *
- * Returns:
- *  HTTP_BAD_REQUEST if we couldn't find the session id of the user, or
- *  OK if no error occured.
- */
-static int add_attributes(am_cache_entry_t *session, request_rec *r,
-                          const char *name_id, LassoSaml2Assertion *assertion)
-{
-    am_dir_cfg_rec *dir_cfg;
-    GList *atr_stmt_itr;
-    LassoSaml2AttributeStatement *atr_stmt;
-    GList *atr_itr;
-    LassoSaml2Attribute *attribute;
-    GList *value_itr;
-    LassoSaml2AttributeValue *value;
-    GList *any_itr;
-    char *content;
-    char *dump;
-    int ret;
-
-    dir_cfg = am_get_dir_cfg(r);
-
-    /* Set expires to whatever is set by MellonSessionLength. */
-    if(dir_cfg->session_length == -1) {
-        /* -1 means "use default. The current default is 86400 seconds. */
-        am_cache_update_expires(r, session, apr_time_now()
-                                + apr_time_make(86400, 0));
-    } else {
-        am_cache_update_expires(r, session, apr_time_now()
-                                + apr_time_make(dir_cfg->session_length, 0));
-    }
-
-    /* Save session information. */
-    ret = am_cache_env_append(session, "NAME_ID", name_id);
-    if(ret != OK) {
-        return ret;
-    }
-
-    /* Update expires timestamp of session. */
-    am_handle_session_expire(r, session, assertion);
-
-    /* assertion->AttributeStatement is a list of
-     * LassoSaml2AttributeStatement objects.
-     */
-    for(atr_stmt_itr = g_list_first(assertion->AttributeStatement);
-        atr_stmt_itr != NULL;
-        atr_stmt_itr = g_list_next(atr_stmt_itr)) {
-
-        atr_stmt = atr_stmt_itr->data;
-        if (!LASSO_IS_SAML2_ATTRIBUTE_STATEMENT(atr_stmt)) {
-            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                          "Wrong type of AttributeStatement node.");
-            continue;
-        }
-
-        /* atr_stmt->Attribute is list of LassoSaml2Attribute objects. */
-        for(atr_itr = g_list_first(atr_stmt->Attribute);
-            atr_itr != NULL;
-            atr_itr = g_list_next(atr_itr)) {
-
-            attribute = atr_itr->data;
-            if (!LASSO_IS_SAML2_ATTRIBUTE(attribute)) {
-                AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                              "Wrong type of Attribute node.");
-                continue;
-            }
-
-            if (attribute->Name == NULL) {
-                AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
-                              "SAML 2.0 attribute without name.");
-                continue;
-            }
-
-            /* attribute->AttributeValue is a list of
-             * LassoSaml2AttributeValue objects.
-             */
-            for(value_itr = g_list_first(attribute->AttributeValue);
-                value_itr != NULL;
-                value_itr = g_list_next(value_itr)) {
-
-
-                value = value_itr->data;
-                if (!LASSO_IS_SAML2_ATTRIBUTE_VALUE(value)) {
-                    AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                                  "Wrong type of AttributeValue node.");
-                    continue;
-                }
-
-                /* value->any is a list with the child nodes of the
-                 * AttributeValue element.
-                 *
-                 * We assume that the list contains a single text node.
-                 */
-                if(value->any == NULL) {
-                    AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
-                                  "AttributeValue element was empty.");
-                    continue;
-                }
-
-                content = "";
-                for (any_itr = g_list_first(value->any);
-                     any_itr != NULL;
-                     any_itr = g_list_next(any_itr)) {
-                        /* Verify that this is a LassoNode object. */
-                        if(!LASSO_NODE(any_itr->data)) {
-                            AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
-                                          "AttributeValue element contained an "
-                                          " element which wasn't a Node.");
-                            continue;
-                        }
-                        dump = lasso_node_dump(LASSO_NODE(any_itr->data));
-                        if (!dump) {
-                            AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
-                                          "AttributeValue content dump failed.");
-                            continue;
-                        }
-                        /* Use the request pool, no need to free results */
-                        content = apr_pstrcat(r->pool, content, dump, NULL);
-                        g_free(dump);
-                }
-                /* Decode and save the attribute. */
-
-                am_diag_printf(r, "%s name=%s value=%s\n",
-                               __func__, attribute->Name, content);
-
-                ret = am_cache_env_append(session, attribute->Name, content);
-                if(ret != OK) {
-                    return ret;
-                }
-            }
-        }
-    }
-
-    return OK;
-}
-
 /* This function validates that the received assertion verify the security level configured by
  * MellonAuthnContextClassRef directives
  */
@@ -1758,14 +1446,15 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
 {
     char *url;
     char *chr;
-    const char *name_id;
+    LassoSaml2NameID *name_id;
     LassoSamlp2Response *response;
     LassoSaml2Assertion *assertion;
     const char *in_response_to;
     am_dir_cfg_rec *dir_cfg;
-    am_cache_entry_t *session;
+    am_session_state_t *session;
     int rc;
-    const char *idp;
+    apr_status_t rv = APR_SUCCESS;
+    const char *idp_entity_id;
 
     url = am_reconstruct_url(r);
     chr = strchr(url, '?');
@@ -1779,16 +1468,13 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
 
     dir_cfg = am_get_dir_cfg(r);
 
-    if(LASSO_PROFILE(login)->nameIdentifier == NULL) {
-        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
-                      "No acceptable name identifier found in"
-                      " SAML 2.0 response.");
+    idp_entity_id = LASSO_PROFILE(login)->remote_providerID;
+
+    name_id = am_get_lasso_name_id(r, LASSO_PROFILE(login), idp_entity_id);
+    if (name_id == NULL) {
         lasso_login_destroy(login);
         return HTTP_BAD_REQUEST;
     }
-
-    name_id = LASSO_SAML2_NAME_ID(LASSO_PROFILE(login)->nameIdentifier)
-        ->content;
 
     response = LASSO_SAMLP2_RESPONSE(LASSO_PROFILE(login)->response);
 
@@ -1873,28 +1559,29 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
 
     /* Create a new session. */
     session = am_new_request_session(r);
-    if(session == NULL) {
+    if (session == NULL) {
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL,
                     "am_new_request_session() failed");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    rc = add_attributes(session, r, name_id, assertion);
+    rc = am_session_add_attributes_from_assertion(session, r,
+                                                  name_id,
+                                                  response->parent.Issuer,
+                                                  assertion);
     if(rc != OK) {
-        am_release_request_session(r, session);
         lasso_login_destroy(login);
         return rc;
     }
 
     /* If requested, save the IdP ProviderId */
     if(dir_cfg->idpattr != NULL) {
-        idp = LASSO_PROFILE(login)->remote_providerID;
-        if(idp != NULL) {
-            rc = am_cache_env_append(session, dir_cfg->idpattr, idp);
-            if(rc != OK) {
-                am_release_request_session(r, session);
+        if(idp_entity_id != NULL) {
+            if (!am_session_set_env_attr_value(r, session,
+                                               dir_cfg->idpattr,
+                                               idp_entity_id)) {
                 lasso_login_destroy(login);
-                return rc;
+                return HTTP_INTERNAL_SERVER_ERROR;
             }
         }
     }
@@ -1904,16 +1591,14 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                       "Unable to accept SSO message."
                       " Lasso error: [%i] %s", rc, lasso_strerror(rc));
-        am_release_request_session(r, session);
         lasso_login_destroy(login);
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
     /* Save the profile state. */
-    rc = am_save_lasso_profile_state(r, session, LASSO_PROFILE(login),
+    rc = am_session_save_lasso_state(r, session, LASSO_PROFILE(login),
                                      saml_response);
     if(rc != OK) {
-        am_release_request_session(r, session);
         lasso_login_destroy(login);
         return rc;
     }
@@ -1921,9 +1606,17 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
     /* Mark user as logged in. */
     session->logged_in = 1;
 
-    am_release_request_session(r, session);
+    /* Store the session and free resources */
+    rv = am_session_store(r, session);
+    if (rv != APR_SUCCESS) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "failed to store session");
+        lasso_login_destroy(login);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    session = NULL;
     lasso_login_destroy(login);
-
+    login = NULL;
 
     /* No RelayState - we don't know what to do. Use default login path. */
     if(relay_state == NULL || strlen(relay_state) == 0) {
@@ -2044,7 +1737,7 @@ static int am_handle_post_reply(request_rec *r)
     /* Process login responce. */
     rc = lasso_login_process_authn_response_msg(login, saml_response);
     am_diag_log_lasso_node(r, 0, LASSO_PROFILE(login)->response,
-                           "SAML Response (%s):", __func__);
+                           "Receive SAML Post Response (%s):", __func__);
     if (rc != 0) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                       "Error processing authn response."
@@ -2144,7 +1837,7 @@ static int am_handle_paos_reply(request_rec *r)
     /* Process login response. */
     rc = lasso_login_process_paos_response_msg(login, post_data);
     am_diag_log_lasso_node(r, 0, LASSO_PROFILE(login)->response,
-                           "SAML Response (%s):", __func__);
+                           "Receive SAML PAOS Response (%s):", __func__);
     if (rc != 0) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                       "Error processing ECP authn response."
@@ -2290,7 +1983,7 @@ static int am_handle_artifact_reply(request_rec *r)
 
     rc = lasso_login_process_response_msg(login, response);
     am_diag_log_lasso_node(r, 0, LASSO_PROFILE(login)->response,
-                           "SAML Response (%s):", __func__);
+                           "Receive SAML Artifact Response (%s):", __func__);
     if(rc != 0) {
         AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
                       "Failed to handle HTTP-Artifact response data."
@@ -2967,7 +2660,9 @@ static int am_set_authn_request_content(request_rec *r, LassoLogin *login)
 {
 
     am_diag_log_lasso_node(r, 0, LASSO_PROFILE(login)->request,
-                           "SAML AuthnRequest: http_method=%s URL=%s",
+                           "Send SAML Authn Request (%s): "
+                           "http_method=%s URL=%s",
+                           __func__,
                            am_diag_lasso_http_method_str(login->http_method),
                            LASSO_PROFILE(login)->msg_url);
 
@@ -3604,7 +3299,7 @@ int am_auth_mellon_user(request_rec *r)
 {
     am_dir_cfg_rec *dir = am_get_dir_cfg(r);
     int return_code = HTTP_UNAUTHORIZED;
-    am_cache_entry_t *session;
+    am_session_state_t *session;
     const char *ajax_header;
 
     if (r->main) {
@@ -3651,7 +3346,7 @@ int am_auth_mellon_user(request_rec *r)
 
             if(session) {
                 /* Release the session. */
-                am_release_request_session(r, session);
+                am_release_request_session(r, &session);
             }
 
             /*
@@ -3707,7 +3402,7 @@ int am_auth_mellon_user(request_rec *r)
         if(return_code != OK) {
             am_diag_printf(r, "%s failed am_check_permissions, status=%d\n",
                            __func__, return_code);
-            am_release_request_session(r, session);
+            am_release_request_session(r, &session);
 
             return return_code;
         }
@@ -3716,10 +3411,10 @@ int am_auth_mellon_user(request_rec *r)
         /* The user has been authenticated, and we can now populate r->user
          * and the r->subprocess_env with values from the session store.
          */
-        am_cache_env_populate(r, session);
+        am_session_export_env(r, session);
 
         /* Release the session. */
-        am_release_request_session(r, session);
+        am_release_request_session(r, &session);
 
         return OK;
 
@@ -3741,7 +3436,7 @@ int am_auth_mellon_user(request_rec *r)
              * Now we populate the environment with information about
              * the user.
              */
-            am_cache_env_populate(r, session);
+            am_session_export_env(r, session);
         } else {
             am_diag_printf(r, "%s am_enable_info, no valid session\n",
                            __func__);
@@ -3749,7 +3444,7 @@ int am_auth_mellon_user(request_rec *r)
 
         if(session != NULL) {
             /* Release the session. */
-            am_release_request_session(r, session);
+            am_release_request_session(r, &session);
         }
 
         /* We shouldn't really do any access control, so we always return
@@ -3763,7 +3458,7 @@ int am_auth_mellon_user(request_rec *r)
 int am_check_uid(request_rec *r)
 {
     am_dir_cfg_rec *dir = am_get_dir_cfg(r);
-    am_cache_entry_t *session;
+    am_session_state_t *session;
     int return_code = HTTP_UNAUTHORIZED;
 
     if (r->main) {
@@ -3852,7 +3547,7 @@ int am_check_uid(request_rec *r)
     if(!session->logged_in) {
         am_diag_printf(r, "%s session not logged in,"
                        " return HTTP_UNAUTHORIZED\n", __func__);
-        am_release_request_session(r, session);
+        am_release_request_session(r, &session);
         return HTTP_UNAUTHORIZED;
     }
 
@@ -3861,17 +3556,17 @@ int am_check_uid(request_rec *r)
     if(return_code != OK) {
         am_diag_printf(r, "%s failed am_check_permissions, status=%d\n",
                        __func__, return_code);
-        am_release_request_session(r, session);
+        am_release_request_session(r, &session);
         return return_code;
     }
 
     /* The user has been authenticated, and we can now populate r->user
      *  and the r->subprocess_env with values from the session store.
      */
-    am_cache_env_populate(r, session);
+    am_session_export_env(r, session);
 
     /* Release the session. */
-    am_release_request_session(r, session);
+    am_release_request_session(r, &session);
 
     return OK;
 }

@@ -2,6 +2,35 @@
 
 #include <lasso/utils.h>
 
+/*
+ * Why is lasso_log here? In 2010 Benjamin Dauvergne moved logging
+ * function and macros to their own module. This necessitated adding
+ * this block to the top of every language binding file to prevent an
+ * unresolved reference to lasso_log. Seems to me this is broken, but
+ * we can't fix it so we'll have to live with it for the time being.
+ */
+
+#if defined(__GNUC__)
+#  define lasso_log(level, filename, line, function, format, args...) \
+        g_log("Lasso", level, "%s:%i:%s" format, filename, line, function, ##args)
+#elif defined(HAVE_VARIADIC_MACROS)
+#  define lasso_log(level, format, line, function, ...)  \
+        g_log("Lasso", leve, "%s:%i:%s" format, filename, line, function, __VA_ARGS__)
+#else
+static inline void lasso_log(GLogLevelFlags level, const char *filename,
+    int line, const char *function, const char *format, ...)
+{
+	va_list ap;
+	char s[1024];
+	va_start(ap, format);
+	g_vsnprintf(s, 1024, format, ap);
+	va_end(ap);
+    g_log("Lasso", level, "%s:%i:%s %s", filename, line, function, s);
+}
+#define lasso_log lasso_log
+#endif
+
+
 #else
 
 #define lasso_assign_string(dest,src)           \

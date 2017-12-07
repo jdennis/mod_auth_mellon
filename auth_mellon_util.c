@@ -359,15 +359,15 @@ const am_cond_t *am_cond_substitue(request_rec *r, const am_cond_t *ce,
  *
  * Parameters:
  *  request_rec *r              The current request.
- *  am_cache_entry_t *session   The current session.
+ *  am_session_state_t *session The current session.
  *
  * Returns:
  *  OK if the user has access and HTTP_FORBIDDEN if he doesn't.
  */
-int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+int am_check_permissions(request_rec *r, am_session_state_t *session)
 {
     am_dir_cfg_rec *dir_cfg;
-    int i, j;
+    int i;
     int skip_or = 0;
     const apr_array_header_t *backrefs = NULL;
 
@@ -376,6 +376,7 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
     /* Iterate over all cond-directives */
     for (i = 0; i < dir_cfg->cond->nelts; i++) {
         const am_cond_t *ce;
+        const char *name = NULL;
         const char *value = NULL;
         int match = 0;
 
@@ -407,40 +408,13 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
             continue;
         }
         
-        /* 
-         * look for a match on each value for this attribute, 
-         * stop on first match.
-         */
-        for (j = 0; (j < session->size) && !match; j++) {
-            const char *varname = NULL;
-            am_envattr_conf_t *envattr_conf = NULL;
-
-            /*
-             * if MAP flag is set, check for remapped 
-             * attribute name with mellonSetEnv
-             */
-            if (ce->flags & AM_COND_FLAG_MAP) {
-                envattr_conf =  (am_envattr_conf_t *)apr_hash_get(dir_cfg->envattr, 
-                                         am_cache_entry_get_string(session,&session->env[j].varname),
-                                         APR_HASH_KEY_STRING);
-                                                    
-                if (envattr_conf != NULL)
-                    varname = envattr_conf->name;
-            }
-
-            /*
-             * Otherwise or if not found, use the attribute name
-             * sent by the IdP.
-             */
-            if (varname == NULL)
-                varname = am_cache_entry_get_string(session,
-                                                    &session->env[j].varname);
-                      
-            if (strcmp(varname, ce->varname) != 0)
-                    continue;
-
-            value = am_cache_entry_get_string(session, &session->env[j].value);
-
+        name = ce->varname;
+        /* If MAP flag is set, check for remapped  attribute name with mellonSetEnv */
+        if (ce->flags & AM_COND_FLAG_MAP) {
+            name = am_mapped_env_attr_name(r, name, NULL);
+        }
+        value = am_session_get_first_env_attr_value(r, session, name);
+        if (value) {
             /*
              * Substiture backrefs if available
              */
@@ -2507,6 +2481,489 @@ char *am_get_assertion_consumer_service_by_binding(LassoProvider *provider, cons
     return url;
 }
 
+/* This function parses a timestamp for a SAML 2.0 condition.
+ *
+ * Parameters:
+ *  request_rec *r          The current request. Used for logging of errors.
+ *  const char *timestamp   The timestamp we should parse. Must be on
+ *                          the following format: "YYYY-MM-DDThh:mm:ssZ"
+ *
+ * Returns:
+ *  An apr_time_t value with the timestamp, or 0 on error.
+ */
+apr_time_t am_parse_timestamp(request_rec *r, const char *timestamp)
+{
+    size_t len;
+    int i;
+    char c;
+    const char *expected;
+    apr_time_exp_t time_exp;
+    apr_time_t res;
+    apr_status_t rc;
+
+    len = strlen(timestamp);
+
+    /* Verify length of timestamp. */
+    if(len < 20){
+        AM_LOG_RERROR(APLOG_MARK, APLOG_WARNING, 0, r,
+                      "Invalid length of timestamp: \"%s\".", timestamp);
+    }
+
+    /* Verify components of timestamp. */
+    for(i = 0; i < len - 1; i++) {
+        c = timestamp[i];
+
+        expected = NULL;
+
+        switch(i) {
+
+        case 4:
+        case 7:
+            /* Matches "    -  -            " */
+            if(c != '-') {
+                expected = "'-'";
+            }
+            break;
+
+        case 10:
+            /* Matches "          T         " */
+            if(c != 'T') {
+                expected = "'T'";
+            }
+            break;
+
+        case 13:
+        case 16:
+            /* Matches "             :  :   " */
+            if(c != ':') {
+                expected = "':'";
+            }
+            break;
+
+        case 19:
+            /* Matches "                   ." */
+            if (c != '.') {
+                expected = "'.'";
+            }
+            break;
+
+        default:
+            /* Matches "YYYY MM DD hh mm ss uuuuuu" */
+            if(c < '0' || c > '9') {
+                expected = "a digit";
+            }
+            break;
+        }
+
+        if(expected != NULL) {
+            AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                          "Invalid character in timestamp at position %i."
+                          " Expected %s, got '%c'. Full timestamp: \"%s\"",
+                          i, expected, c, timestamp);
+            return 0;
+        }
+    }
+
+    if (timestamp[len - 1] != 'Z') {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Timestamp wasn't in UTC (did not end with 'Z')."
+                      " Full timestamp: \"%s\"",
+                      timestamp);
+        return 0;
+    }
+
+
+    time_exp.tm_usec = 0;
+    if (len > 20) {
+        /* Subsecond precision. */
+        if (len > 27) {
+            /* Timestamp has more than microsecond precision. Just clip it to
+             * microseconds.
+             */
+            len = 27;
+        }
+        len -= 1; /* Drop the 'Z' off the end. */
+        for (i = 20; i < len; i++) {
+            time_exp.tm_usec = time_exp.tm_usec * 10 + timestamp[i] - '0';
+        }
+        for (i = len; i < 26; i++) {
+            time_exp.tm_usec *= 10;
+        }
+    }
+
+    time_exp.tm_sec = (timestamp[17] - '0') * 10 + (timestamp[18] - '0');
+    time_exp.tm_min = (timestamp[14] - '0') * 10 + (timestamp[15] - '0');
+    time_exp.tm_hour = (timestamp[11] - '0') * 10 + (timestamp[12] - '0');
+    time_exp.tm_mday = (timestamp[8] - '0') * 10 + (timestamp[9] - '0');
+    time_exp.tm_mon = (timestamp[5] - '0') * 10 + (timestamp[6] - '0') - 1;
+    time_exp.tm_year = (timestamp[0] - '0') * 1000 +
+        (timestamp[1] - '0') * 100 + (timestamp[2] - '0') * 10 +
+        (timestamp[3] - '0') - 1900;
+
+    time_exp.tm_wday = 0; /* Unknown. */
+    time_exp.tm_yday = 0; /* Unknown. */
+
+    time_exp.tm_isdst = 0; /* UTC, no daylight savings time. */
+    time_exp.tm_gmtoff = 0; /* UTC, no offset from UTC. */
+
+    rc = apr_time_exp_gmt_get(&res, &time_exp);
+    if(rc != APR_SUCCESS) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, rc, r,
+                      "Error converting timestamp \"%s\".",
+                      timestamp);
+        return 0;
+    }
+
+    return res;
+}
+
+
+/*
+ * With XML how do you distinguish between an empty value and NULL?
+ *
+ * An empty value is a value that was initialized but contains no data
+ * (e.g. for string data it would be the empty string ""). A NULL
+ * value was never initialized to any value. XML uses the term nil to
+ * mean NULL. Nil is indicated by setting the xsi:nil attribute on the
+ * element to "true" or "1", "true" is preferred.
+ *
+ * Either of these two constructs <FOO/>, or <FOO></FOO> would parse
+ * FOO's content as the empty string. To indicate FOO was never set to
+ * any value (e.g. is NULL) set the xsi:nil attribute on the FOO
+ * element like this <FOO xsi:nil="true"/>.
+ */
+
+/**
+ * Join each string in array with separator
+ *
+ * Given an array of strings join each string with common separator
+ *
+ * @param[in] pool      Memory allocation pool
+ * @param[i]  strings   Array of strings to be joined
+ * @param[in] separator String used to separate array members
+ *
+ * @returns New allocated string
+ */
+char *
+am_str_join(apr_pool_t *pool, apr_array_header_t *strings,
+            const char *separator)
+{
+    struct iovec *iov;
+    int nvec, i;
+    size_t separator_len = strlen(separator);
+    const char *value;
+    
+    if (strings->nelts == 0) {
+        return apr_pstrdup(pool, "");
+    }
+
+    if (strings->nelts == 1) {
+        value =  APR_ARRAY_IDX(strings, 0, char *);
+        return apr_pstrdup(pool, value);
+    }
+
+    nvec = strings->nelts*2 - 1;
+    iov = apr_palloc(pool, sizeof(struct iovec) * nvec);
+
+    for (i = 0; i < strings->nelts-1; i++) {
+        value =  APR_ARRAY_IDX(strings, i, char *);
+        iov[i*2].iov_base = (char *)value;
+        iov[i*2].iov_len = strlen(value);
+
+        iov[i*2+1].iov_base = (char *)separator;
+        iov[i*2+1].iov_len = separator_len;
+    }
+    value =  APR_ARRAY_IDX(strings, i, char *);
+    iov[i*2].iov_base = (char *)value;
+    iov[i*2].iov_len = strlen(value);
+    
+    return apr_pstrcatv(pool, iov, nvec, NULL);
+
+}
+
+/**
+ * Get the first child node whose element name matches
+ *
+ *
+ * @param[in] node The node whose children are searched
+ * @param[in] name The element name
+ *
+ * @returns child node or NULL if not found
+ */
+xmlNodePtr
+am_xml_get_first_child(xmlNodePtr node, const char *name, const char *ns_href)
+{
+    xmlNodePtr child_node = NULL;
+    
+    for (child_node = node->children;
+         child_node;
+         child_node = child_node->next) {
+        if (IS_NODE(child_node, name, ns_href)) return child_node;
+    }
+
+    return NULL;
+}
+
+/**
+ * Convert time value to RFC 8601 string representation in UTC time zone
+ *
+ * @param[in] pool Memory allocation pool
+ * @param[in] t    time value
+ *
+ * @returns RFC 8601 string in UTC time zone
+ */
+char *
+am_time_t_to_8601(apr_pool_t *pool, apr_time_t t)
+{
+    char *buf;
+    apr_time_exp_t tm;
+    apr_size_t ret_size;
+
+    buf = apr_palloc(pool, ISO_8601_BUF_SIZE);
+    if (!buf) return NULL;
+
+    apr_time_exp_gmt(&tm, t);
+    apr_strftime(buf, &ret_size, ISO_8601_BUF_SIZE, ISO_8601_FMT, &tm);
+
+    /* on errror assure return NULL */
+    if (ret_size == 0) return NULL;
+
+    return buf;
+}
+
+/**
+ * Map an env attribute to new name, optionally return prefixed name
+ *
+ * Given an attribute name determine if it should be mapped to a new name.
+ * If the name should be mapped the result is the new name otherwise
+ * the result is the original name. Optionally the prefixed version of
+ * the result can be returned in the prefixed_out parameter if it
+ * is non-NULL.
+ *
+ * @param[in]  r            Current HTTP request
+ * @param[in]  attr_name    Name to map
+ * @param[out] prefixed_out If non-NULL return prefixed version of mapped name
+ *
+ * @returns mapped name
+ */
+const char *
+am_mapped_env_attr_name(request_rec *r, const char *attr_name,
+                        const char **prefixed_out)
+{
+    am_dir_cfg_rec *dir_cfg = am_get_dir_cfg(r);
+    am_envattr_conf_t *env_attr_conf = NULL;
+    const char *mapped_name = NULL;
+    const char *prefixed_name = NULL;
+    bool prefixed = true;
+
+    env_attr_conf = (am_envattr_conf_t *)
+        apr_hash_get(dir_cfg->envattr, attr_name, APR_HASH_KEY_STRING);
+
+    if (env_attr_conf != NULL) {
+        mapped_name = env_attr_conf->name;
+        if (!env_attr_conf->prefixed) {
+            prefixed = false;
+        }
+    } else {
+        mapped_name = attr_name;
+    }
+
+    if (prefixed_out) {
+        if (prefixed) {
+            prefixed_name = apr_pstrcat(r->pool, ENV_ATTR_PREFIX,
+                                        mapped_name, NULL);
+        } else {
+            prefixed_name = mapped_name;
+        }
+        *prefixed_out = prefixed_name;
+    }
+    
+    return mapped_name;
+}
+
+/**
+ * Callback used by libxml2 to report errors
+ *
+ * @param[in] data untyped anonymous data, we use for request_rec ptr
+ * @param[in] msg  message format string
+ * @param[in] ...  vararg list of optional printf style parameters
+ *
+ * @returns void
+ */
+static void am_xml_error_handler(void *data, const char *msg, ...) {
+    xmlParserCtxtPtr ctx = (xmlParserCtxtPtr)data;
+    request_rec *r = (request_rec *)ctx->_private;
+    va_list ap;
+    char *buf = NULL;
+
+    if (msg) {
+	va_start(ap, msg);
+        buf = apr_pvsprintf(r->pool, msg, ap);
+        va_end(ap);
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r, "XML Error: %s", buf);
+    }
+}
+
+/**
+ * Parse XML text into an XML document object.
+ *
+ * @param[in] r Current HTTP request
+ * @param[in] xml_text XML text to be parsed.
+ *
+ * @returns pointer to XML document object or NULL if failure
+ */
+xmlDocPtr am_get_xml_doc_from_string(request_rec *r, const char *xml_text)
+{
+    xmlParserCtxtPtr ctx = NULL;
+    xmlDocPtr doc = NULL;
+    
+    if ((ctx = xmlNewParserCtxt()) == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "cannot create xml memory parser");
+        return NULL;
+    }
+    ctx->_private = r;
+    ctx->sax->error = am_xml_error_handler;
+
+    doc = xmlCtxtReadMemory(ctx, xml_text, strlen(xml_text), NULL, NULL, 0);
+    xmlFreeParserCtxt(ctx);
+    return doc;
+}
+
+/**
+ * Render an XML document object into XML text
+ *
+ * Given an XML document object convert it into a text representation.
+ *
+ * @param[in] r      Current HTTP request
+ * @param[in] doc    The XML docuent object to be rendered as text
+ * @param[in] format Pretty print the document if true
+ *
+ * @returns pointer to XML text or NULL if failure
+ */
+char *am_xml_doc_to_string(request_rec *r, xmlDocPtr doc, int format)
+{
+    xmlChar *xml_text;
+    int xml_text_len;
+    char *string;
+        
+    xmlDocDumpFormatMemory(doc, &xml_text, &xml_text_len, format);
+
+    /* Don't mix xml memory with request memory, copy the buf */
+    string = apr_pstrdup(r->pool, (const char *)xml_text);
+    xmlFree(xml_text);
+    return string;
+}
+
+/**
+ * Render an XML node into XML text
+ *
+ * Given an XML node convert it into a text representation, including
+ * all it's children.
+ *
+ * @param[in] r        Current HTTP request
+ * @param[in] xml_node The XML node to be rendered as text
+ * @param[in] format   Pretty print the document if true
+ *
+ * @returns pointer to XML text or NULL if failure
+ */
+char* am_xmlnode_to_string(request_rec *r, xmlNode *node, int format)
+{
+    xmlOutputBufferPtr output_buffer;
+    xmlBuffer *buffer;
+    char *string;
+
+    if (! node) {
+        return NULL;
+    }
+
+    buffer = xmlBufferCreate();
+    output_buffer = xmlOutputBufferCreateBuffer(buffer, NULL);
+    xmlNodeDumpOutput(output_buffer, NULL, node, 0, format, NULL);
+    xmlOutputBufferClose(output_buffer);
+    xmlBufferAdd(buffer, BAD_CAST "", 1);
+    
+    /* Don't mix xml memory with request memory, copy the buf */
+    string = apr_pstrdup(r->pool, (const char *)xmlBufferContent(buffer));
+    xmlBufferFree(buffer);
+    return string;
+}
+
+/**
+ * Convert a LassoNode to an XML text representation
+ *
+ * Note, the result is not an XML document, rather it is an XML fragment.
+ *
+ * @param[in] r    Current HTTP request
+ * @param[in] node The LassoNode to convert to XML text
+ *
+ * @returns XML text string,
+ */
+const char *
+am_lasso_node_to_string(request_rec *r, LassoNode *node)
+{
+    if (node == NULL) {
+        return NULL;
+    }
+    return (const char *)lasso_node_export_to_xml(node);
+}
+
+/**
+ * Assure NameID is qualified with a namespace
+ *
+ * A SAML NameID string is only unique to the Idp that generated that
+ * NameID. To avoid name collisions between different IdP's SAML
+ * provides the NameQualifier and SPNameQualifier as optional data
+ * elements to qualify the bare NameID value. However, many providers
+ * fail to provide a qualifying namespace when they generate a NameID,
+ * this opens us up to a potential name collision. Therefore we always
+ * assure any NameID we operate on is namespace qualified.
+ *
+ * In addition the SAML spec says the Format attribute is optional and
+ * if absent it shall be interpredted as
+ * urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified, therefore we
+ * also normallize the Format attribute as well.
+ *
+ * @param[in] r                      Current HTTP request
+ * @param[in] name_id                The name_id to normalize
+ * @param[in] default_name_qualifier Namespace to use if absent
+ *
+ * @returns error code
+ */
+apr_status_t
+am_normalize_lasso_name_id(request_rec *r, LassoSaml2NameID *name_id,
+                           const char *default_name_qualifier)
+{
+    
+    if (default_name_qualifier == NULL) {
+        return APR_EINVAL;
+    }
+
+    if (name_id->NameQualifier == NULL) {
+        lasso_assign_string(name_id->NameQualifier, default_name_qualifier);
+    }
+
+    if (name_id->Format == NULL) {
+        lasso_assign_string(name_id->Format,
+                            LASSO_SAML2_NAME_IDENTIFIER_FORMAT_UNSPECIFIED);
+    }
+
+    return APR_SUCCESS;
+}
+
+/**
+ * Convert a LassoSaml2NameID to a string
+ *
+ * @param[in] r Current HTTP request
+ * @param[in] name_id   The name_id to convert to a string
+ *
+ * @returns textural representation of the LassoSaml2NameID
+ */
+const char *
+am_lasso_name_id_string(request_rec *r, LassoSaml2NameID *name_id)
+{
+    return am_lasso_node_to_string(r, (LassoNode *)name_id);
+}
 
 #ifdef HAVE_ECP
 
@@ -2676,4 +3133,135 @@ am_saml_response_status_str(request_rec *r, LassoNode *node)
                         "StatusCode1=\"%s\", StatusCode2=\"%s\", "
                         "StatusMessage=\"%s\"",
                         status_code1, status_code2, status->StatusMessage);
+}
+
+#ifndef HAVE_apr_pescape_hex
+
+/*
+ * apr_escape was added to APR in version 1.5.0 (June 2016). If the
+ * APR version is less than 1.5.0 we provide a compatible implementation.
+ */
+
+const char *
+apr_pescape_hex(apr_pool_t *p, const void *src, apr_size_t srclen, int colon)
+{
+    static const char hex_alphabet[16] = "0123456789abcdef";
+    apr_size_t len, i;
+    const unsigned char *src_data = src;
+    char *dst;
+    char *hex;
+
+    if (colon && srclen) {
+        len = srclen * 3;
+    } else {
+        len = srclen * 2 + 1;
+    }
+
+    hex = apr_palloc(p, len);
+    if (hex == NULL) return NULL;
+    dst = hex;
+    
+    for (i = 0; i < srclen; i++) {
+        if (colon && i) {
+            *dst++ = ':';
+        }
+        *dst++ = hex_alphabet[src_data[i] >> 4];
+        *dst++ = hex_alphabet[src_data[i] & 0xf];
+    }
+    *dst = '\0';
+
+    return hex;
+}
+
+#endif
+
+/**
+ * Compute the SHA256 digest of the inputdata, return digest as hex string
+ *
+ * description
+ *
+ * @param[in] r    Current HTTP request
+ * @param[in] data input data to compute digest of
+ * @param[in] data_len Number of octets in data
+ *
+ * @returns 64 character hexidecimal string representing SHA256 digest
+ */
+const char *
+am_sha256_sum(request_rec *r,
+              const unsigned char *data, apr_size_t data_len)
+{
+    apr_crypto_hash_t *ctx;
+    unsigned char *binary_digest = NULL;
+
+    ctx = apr_crypto_sha256_new(r->pool);
+    if (ctx == NULL)
+        return NULL;
+
+    binary_digest = apr_pcalloc(r->pool, ctx->size);
+    if (binary_digest == NULL)
+        return NULL;
+
+    ctx->init(ctx);
+    ctx->add(ctx, data, data_len);
+    ctx->finish(ctx, binary_digest);
+
+    return apr_pescape_hex(r->pool, binary_digest, ctx->size, 0);
+}
+
+LassoSamlp2RequestAbstract *
+am_get_request_abstract(request_rec *r, LassoProfile *profile)
+{
+    LassoSamlp2RequestAbstract *request_abstract = NULL;
+
+    if (profile == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "no profile supplied");
+        return NULL;
+    }
+
+    if (profile->request == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "profile request is NULL");
+        return NULL;
+    }
+
+    if (!LASSO_IS_SAMLP2_REQUEST_ABSTRACT(profile->request)) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "expected profile request to be "
+                      "LassoSamlp2RequestAbstract but got %s",
+                      lasso_node_get_name((LassoNode*)profile->request));
+        return NULL;
+    }
+
+    request_abstract = (LassoSamlp2RequestAbstract *)profile->request;
+    return request_abstract;
+}
+
+LassoSamlp2StatusResponse *
+am_get_status_response(request_rec *r, LassoProfile *profile)
+{
+    LassoSamlp2StatusResponse *status_response = NULL;
+
+    if (profile == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "no profile supplied");
+        return NULL;
+    }
+
+    if (profile->response == NULL) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "profile response is NULL");
+        return NULL;
+    }
+
+    if (!LASSO_IS_SAMLP2_STATUS_RESPONSE(profile->response)) {
+        AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                      "expected profile response to be "
+                      "LassoSamlp2StatusResponse but got %s",
+                      lasso_node_get_name((LassoNode*)profile->response));
+        return NULL;
+    }
+
+    status_response = (LassoSamlp2StatusResponse *)profile->response;
+    return status_response;
 }

@@ -83,26 +83,51 @@ for mod_auth_mellon. The following is an example configuration:
 # every virtual server and location in this instance of apache.
 ###########################################################################
 
-# MellonCacheSize sets the maximum number of sessions which can be active
-# at once. When mod_auth_mellon reaches this limit, it will begin removing
-# the least recently used sessions. The server must be restarted before any
-# changes to this option takes effect.
-# Default: MellonCacheSize 100
-MellonCacheSize 100
+# MellonSoCache The Apache Shared Object Cache provider and it's provider
+# specific (optional) configuration parameters. Mellon will use this
+# Apache Shared Object Cache provider to store it's persistent session data
+# as well as other Mellon internal persisted data.
+#
+# The directive has the form name:args where the provider name is
+# separated by the provider arguments by a colon. If no provider
+# arguments are required the form is just the provider name.
+# 
+# The available Apache Shared Object Cache providers are documented in
+# the Apache Shared Object Cache documentation. After selecting a
+# provider you will need to refer to that providers documentation for
+# any provider specific configuration parameters you might need to
+# pass in the args portion of the directive. If the MellonSoCache
+# directive is not defined it defaults to Apache's default shared
+# object cache provider. Mellon has no control over what Apache's
+# default provider is but currently it is "shmcb".
+#
+# As an example, to use memcache running locally on port 11211 the
+# directive would be:
+#
+# MellonSoCache memcache:localhost:11211
+#
+# where "memcache" is the provider name and it's optional are
+# "localhost:11211"
 
-# MellonCacheEntrySize sets the maximum size for a single session entry in
-# bytes. When mod_auth_mellon reaches this limit, it cannot store any more
-# data in the session and will return an error. The minimum entry size is
-# 65536 bytes, values lower than that will be ignored and the minimum will
-# be used.
-# Default: MellonCacheEntrySize 196608
+# MellonSoCacheSessionStateEntrySize
+# The maximum number of octets in a socache session state entry.
+# Default: 65536
 
-# MellonLockFile is the full path to a file used for synchronizing access
-# to the session data. The path should only be used by one instance of
-# apache at a time. The server must be restarted before any changes to this
-# option takes effect.
-# Default: MellonLockFile "/var/run/mod_auth_mellon.lock"
-MellonLockFile "/var/run/mod_auth_mellon.lock"
+# MellonCacheSize - DEPRECATED
+# Retained only to prevent module load errors if specified.  If
+# specified it has no effect. This config item will be removed in a
+# future release.
+
+
+# MellonCacheEntrySize - DEPRECATED
+# Retained only to prevent module load errors if specified.  If
+# specified it has no effect. This config item will be removed in a
+# future release.
+
+# MellonLockFile - DEPRECATED
+# Retained only to prevent module load errors if specified.  If
+# specified it has no effect. This config item will be removed in a
+# future release.
 
 # MellonPostDirectory is the full path of a directory where POST requests
 # are saved during authentication. This directory must writable by the
